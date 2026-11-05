@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <radialGradient id="bgGlow" cx="50%" cy="45%" r="65%">
+      <stop offset="0%" stop-color="#181d29" />
+      <stop offset="60%" stop-color="#0f1118" />
+      <stop offset="100%" stop-color="#08090d" />
+    </radialGradient>
+
+    <!-- Metallic Shield Gradient -->
+    <linearGradient id="metalShield" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5a6885" />
+      <stop offset="50%" stop-color="#2a3344" />
+      <stop offset="100%" stop-color="#1a202c" />
+    </linearGradient>
+
+    <!-- Signal Glow (Cyan/Azure) -->
+    <linearGradient id="cyanSignal" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00d8ff" />
+      <stop offset="100%" stop-color="#0088ff" />
+    </linearGradient>
+
+    <!-- Core Center Metal -->
+    <radialGradient id="coreMetal" cx="40%" cy="35%" r="60%">
+      <stop offset="0%" stop-color="#8ba1bf" />
+      <stop offset="60%" stop-color="#3b485d" />
+      <stop offset="100%" stop-color="#141821" />
+    </radialGradient>
+
+    <!-- Glow Filter -->
+    <filter id="neonGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- App Icon Base Plate -->
+  <rect width="512" height="512" rx="116" fill="url(#bgGlow)" />
+  <rect width="508" height="508" x="2" y="2" rx="114" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2" />
+
+  <!-- Outer Layer: Braided Ground/Shield Ring (Centered at 270, 256) -->
+  <path d="M 395 131 A 176 176 0 1 0 395 381" fill="none" stroke="url(#metalShield)" stroke-width="26" stroke-linecap="round" />
+
+  <!-- Live Feed Conductor: High-Voltage Cyan Ring (Centered at 270, 256) -->
+  <path d="M 349 177 A 112 112 0 1 0 349 335" fill="none" stroke="url(#cyanSignal)" stroke-width="24" stroke-linecap="round" filter="url(#neonGlow)" />
+
+  <!-- Inner Dielectric Layer: Concentric Reticle -->
+  <circle cx="270" cy="256" r="62" fill="none" stroke="#1e2738" stroke-width="8" />
+
+  <!-- Central Conductor Shield Collar -->
+  <circle cx="270" cy="256" r="42" fill="url(#coreMetal)" stroke="#00d8ff" stroke-width="3" stroke-opacity="0.5" />
+
+  <!-- Center Pin (Source Core) -->
+  <circle cx="270" cy="256" r="18" fill="url(#cyanSignal)" filter="url(#neonGlow)" />
+  
+  <circle cx="270" cy="256" r="7" fill="#ffffff" />
+</svg>

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+		<title>Screen Relay</title>
+		<style>
+			:root { --bg: #101418; --fg: #e6edf3; --muted: #8b949e; --ok: #3fb950; --bad: #f85149; }
+			* { box-sizing: border-box; }
+			html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+			  font-family: system-ui, sans-serif; overflow: hidden; }
+			#stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+			#video, #canvas { max-width: 100%; max-height: 100%; display: block; image-rendering: optimizeSpeed; }
+			#canvas { background: #000; }
+			#stage.fmp4-mode #canvas { display: none; }
+			#stage.raw-mode #video { display: none; }
+			#status { position: fixed; top: 8px; left: 8px; font-size: 12px; color: var(--muted); }
+			#status::before { content: ""; display: inline-block; width: 8px; height: 8px;
+			  margin-right: 6px; border-radius: 50%; background: var(--muted); vertical-align: middle; }
+			#status.ok::before { background: var(--ok); }
+			#status.err::before { background: var(--bad); }
+			#hint { position: fixed; bottom: 8px; left: 8px; font-size: 11px; color: var(--muted); }
+			#start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+			  cursor: pointer; background: rgba(16, 20, 24, 0.9); font-size: 18px; color: var(--fg); }
+			#start.hidden { display: none; }
+		</style>
+	</head>
+	<body>
+		<div id="status">connecting...</div>
+		<div id="stage">
+			<video id="video" playsinline></video>
+			<canvas id="canvas"></canvas>
+		</div>
+		<div id="start">Click to start</div>
+		<div id="hint">Screen Relay</div>
+		<script src="app.js"></script>
+	</body>
+</html>

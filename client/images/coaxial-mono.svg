@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <!-- Background Plate -->
+  <rect width="512" height="512" rx="112" fill="#0c0e12" />
+  
+  <g fill="none" stroke="currentColor" stroke-linecap="round" color="#f8fafc">
+    <!-- Outer Shield Orbit (Origin: 270, 256; Radius: 160; 45° to 315°) -->
+    <path d="M 383.1 142.9 A 160 160 0 1 0 383.1 369.1" stroke-width="26" />
+    
+    <!-- Middle Conductor Orbit (Origin: 270, 256; Radius: 106; 45° to 315°) -->
+    <path d="M 345 181 A 106 106 0 1 0 345 331" stroke-width="32" />
+    
+    <!-- Inner Core Housing Ring -->
+    <circle cx="270" cy="256" r="46" stroke-width="14" />
+    
+    <!-- Central Conductor Pin -->
+    <circle cx="270" cy="256" r="16" fill="currentColor" stroke="none" />
+  </g>
+</svg>
