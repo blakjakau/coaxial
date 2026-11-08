@@ -610,7 +610,7 @@ func (c *Capture) launch(rs *RelayServer) bool {
     	"aud=false",        // Stops emitting Access Unit Delimiters
 		fmt.Sprintf("bitrate=%s", c.bitrate),
 		fmt.Sprintf("max-bitrate=%s", c.maxrate),
-		fmt.Sprintf("gop-size=%d", c.outFPS),
+		fmt.Sprintf("gop-size=%d", c.outFPS/2),
 		"!", "video/x-h264,profile=constrained-baseline,level=(string)4.1",
 		"!", "h264parse", "config-interval=-1",
 		"!", "video/x-h264,stream-format=byte-stream,alignment=au",
