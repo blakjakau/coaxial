@@ -38,7 +38,9 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"log"
+	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,6 +59,30 @@ var lastInputParseLog int64
 // transient failure (udev rule applied after startup, node not ready) recovers
 // promptly.
 const initRetryInterval = 5000
+
+// relSensitivity is the multiplier applied to the client's relative pointer
+// deltas (pointer-lock movementX/movementY, in CSS pixels) before they are
+// emitted as REL_X/REL_Y events. 1.0 is a 1:1 mapping (one CSS pixel of
+// client movement = one REL_X/REL_Y unit on the host). The host's REL axis
+// unit is screen pixels, so a value > 1.0 makes the remote cursor move faster
+// than the local pointer (useful when the host screen is higher-DPI than the
+// client). Tunable via SCREENRELAY_REL_SENSITIVITY (default 1.0).
+var relSensitivity = parseRelSensitivity()
+
+// parseRelSensitivity reads SCREENRELAY_REL_SENSITIVITY (a float), defaulting
+// to 1.0. A non-numeric or non-positive value falls back to 1.0 (a zero or
+// negative sensitivity would make the relative cursor inert or invert it).
+func parseRelSensitivity() float64 {
+	v := os.Getenv("SCREENRELAY_REL_SENSITIVITY")
+	if v == "" {
+		return 1.0
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		return 1.0
+	}
+	return f
+}
 
 // uinput ioctl request numbers (from include/uapi/linux/uinput.h).
 // _IOW('U', nr, type) = (1<<30) | (sizeof(type)<<16) | ('U'<<8) | nr, 'U'=0x55.
@@ -91,7 +117,10 @@ const (
 
 	synReport = 0x00
 
-	relWheel = 0x0e
+	relX      = 0x00
+	relY      = 0x01
+	relWheel  = 0x08 // updated from 0x0e
+	relHWheel = 0x06 // added for future horizontal wheel support
 
 	absX = 0x00
 	absY = 0x01
@@ -343,6 +372,19 @@ func (i *uinputInjector) createDevice() error {
 	if err := ioctl(fd, uiSetRelbit, relWheel); err != nil {
 		return setErr("UI_SET_RELBIT(REL_WHEEL)", err)
 	}
+	// Relative pointer axes (pointer-lock mode). Both ABS and REL axes are
+	// registered on the SAME device so the client can switch between absolute
+	// (unlocked) and relative (locked) movement without recreating the device
+	// (recreation would destroy the node the compositor is tracking and drop
+	// any in-flight state). The compositor treats a device with both as a
+	// normal pointer; REL events move the cursor by a delta, ABS events set
+	// it to an absolute position.
+	if err := ioctl(fd, uiSetRelbit, relX); err != nil {
+		return setErr("UI_SET_RELBIT(REL_X)", err)
+	}
+	if err := ioctl(fd, uiSetRelbit, relY); err != nil {
+		return setErr("UI_SET_RELBIT(REL_Y)", err)
+	}
 
 	// Absolute pointer axes spanning the full screen.
 	if err := ioctl(fd, uiSetAbsbit, absX); err != nil {
@@ -364,7 +406,7 @@ func (i *uinputInjector) createDevice() error {
 		}
 	}
 
-	log.Printf("input: uinput fd=%d opened; set EV bits (KEY/REL/ABS), 3 buttons, REL_WHEEL, ABS_X/Y, PROP_POINTER, 256 key bits OK", i.fd)
+	log.Printf("input: uinput fd=%d opened; set EV bits (KEY/REL/ABS), 3 buttons, REL_X/Y/WHEEL, ABS_X/Y, PROP_POINTER, 256 key bits OK", i.fd)
 
 	// Describe the device. The MODERN path (kernel >= 5.9) uses two ioctls
 	// that carry the same data in fixed-size structs independent of the
@@ -519,6 +561,8 @@ func (i *uinputInjector) legacyDeviceSetup() error {
 // dispatchInput parses a raw input event from the browser (JSON) and dispatches
 // it to the virtual device. The payload is the JSON body of a kindInput ('I')
 // message (see inputMsg in input_keys.go): {"type","x","y","key","delta","button"}.
+// The "x"/"y" fields are normalized [0,1] positions for "mousemove" but
+// pointer-lock deltas (CSS pixels) for "relmousemove".
 func (i *uinputInjector) dispatchInput(raw []byte) {
 	var msg inputMsg
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -535,6 +579,10 @@ func (i *uinputInjector) dispatchInput(raw []byte) {
 	switch msg.Type {
 	case "mousemove":
 		i.move(msg.X, msg.Y)
+	case "relmousemove":
+		// Pointer-lock mode: x/y carry the pointer-lock deltas
+		// (movementX/movementY, CSS pixels), not normalized positions.
+		i.relMove(msg.X, msg.Y)
 	case "mousedown":
 		i.button(btnFor(msg.Button), true)
 	case "mouseup":
@@ -584,6 +632,33 @@ func (i *uinputInjector) move(nx, ny float64) {
 	i.emit(evSyn, synReport, 0)
 }
 
+// relMove emits a RELATIVE pointer movement (pointer-lock mode). dx,dy are the
+// client's pointer-lock deltas (movementX/movementY, in CSS pixels) and are
+// scaled by relSensitivity before being emitted as REL_X/REL_Y events. Unlike
+// move (absolute, which sets the cursor to a screen position), relMove shifts
+// the cursor by a delta from its current position - the compositor accumulates
+// the REL events, so the remote cursor tracks the local pointer's motion
+// 1:1 (times the sensitivity) without the client needing to know the host's
+// cursor position. A zero delta is a no-op (no event, no SYN) so idle
+// pointer-lock frames do not emit empty reports.
+func (i *uinputInjector) relMove(dx, dy float64) {
+	if dx == 0 && dy == 0 {
+		return
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if !i.ensureInitLocked() {
+		return
+	}
+	// Round to int32 after scaling: the client sends CSS-pixel deltas (which
+	// can be fractional on high-DPI displays), and the REL axis is integer
+	// screen pixels. Rounding (not truncating) keeps sub-pixel motion
+	// accumulated across frames rather than dropped.
+	i.emit(evRel, relX, int32(math.Round(dx*relSensitivity)))
+	i.emit(evRel, relY, int32(math.Round(dy*relSensitivity)))
+	i.emit(evSyn, synReport, 0)
+}
+
 // button emits a pointer button press (pressed=true) or release (false).
 func (i *uinputInjector) button(code uint16, pressed bool) {
 	i.mu.Lock()
@@ -600,10 +675,28 @@ func (i *uinputInjector) button(code uint16, pressed bool) {
 }
 
 // wheelUnitsPerNotch is the REL_WHEEL magnitude emitted per client scroll
+// wheelUnitsPerNotch is the REL_WHEEL magnitude emitted per client scroll
 // notch. A single REL_WHEEL unit scrolls by a very small amount in GNOME, so
 // one unit per notch feels nearly inert. Emitting several units per notch
-// gives a normal-feeling scroll step (tune to taste).
-const wheelUnitsPerNotch = 3
+// gives a normal-feeling scroll step. Tunable via SCREENRELAY_WHEEL_UNITS_PER_NOTCH
+// (default 3) so the scroll "feel" can be tuned to the host's compositor
+// without a rebuild.
+var wheelUnitsPerNotch = parseWheelUnitsPerNotch()
+
+// parseWheelUnitsPerNotch reads SCREENRELAY_WHEEL_UNITS_PER_NOTCH (a positive
+// int), defaulting to 3. A zero or negative value falls back to 3 (zero
+// amplification would make the wheel inert; negative would invert it).
+func parseWheelUnitsPerNotch() int32 {
+	v := os.Getenv("SCREENRELAY_WHEEL_UNITS_PER_NOTCH")
+	if v == "" {
+		return 1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 1
+	}
+	return int32(n)
+}
 
 // wheel emits a vertical scroll (delta in client wheel "notch" units; the
 // sign is preserved). Each notch is amplified to wheelUnitsPerNotch REL_WHEEL

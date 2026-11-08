@@ -41,7 +41,13 @@ var evKeyLinux = map[string]uint16{
 }
 
 // inputMsg is the JSON payload the client sends for a kind 'I' (input)
-// message. x/y are normalized [0,1] pointer positions (mouse/wheel only);
+// message. The meaning of x/y depends on the event type:
+//   - mousemove: normalized [0,1] pointer positions (within the visible video
+//     element); the server maps them to an absolute screen position.
+//   - relmousemove: pointer-lock deltas (movementX/movementY, in CSS pixels);
+//     the server scales them by relSensitivity and emits REL_X/REL_Y (a
+//     relative cursor nudge). The same x/y fields carry the delta so no new
+//     wire fields are needed.
 // key is the JS KeyboardEvent.code (keydown/keyup only); delta is the wheel
 // scroll delta (wheel only); button is the JS MouseEvent.button (0=left,
 // 1=middle, 2=right) for mousedown/mouseup.

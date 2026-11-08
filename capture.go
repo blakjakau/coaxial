@@ -35,10 +35,9 @@ const (
 	// monitor (xrandr) and streams at min(actual, max), so a 3440x1440
 	// monitor streams at 2560x1440 and the 179.92Hz source is resampled
 	// to a clean 60fps CFR output.
-	maxWidth   = 3440 
-	maxHeight  = 1440
-	maxFPS     = 60
-	outputScale = 1 // not yet wired into the pipeline (see newCapture)
+	maxWidth  = 3440
+	maxHeight = 1440
+	maxFPS    = 90
 
 	// defaultOutFPS is the clean output framerate the stream is resampled to
 	// (GStreamer videorate). The source's delivery rate varies (~50-79fps on
@@ -51,6 +50,115 @@ const (
 	defaultHeight = 1080
 	defaultOutFPS = 60
 )
+
+// captureParams is the tunable capture/encode configuration. The initial
+// values come from the environment (SCREENRELAY_BITRATE / SCREENRELAY_MAXRATE
+// / SCREENRELAY_FPS, see defaultCaptureParams); the client can change them at
+// runtime via the settings channel (kindSettings, 'S'), which restarts the
+// capture pipeline with the new values. Resolution is NOT stored here: it is
+// derived from the selected monitor (MonitorID) at capture start, clamped to
+// the maximum stream constraints and scaled by Scale.
+type captureParams struct {
+	Bitrate   string  `json:"bitrate"` // target VBR bitrate in kbps, e.g. "5500"
+	Maxrate   string  `json:"maxrate"` // peak bitrate in kbps, e.g. "14400"
+	FPS       int     `json:"fps"`     // clean output framerate (videorate target)
+	Scale     float64 `json:"scale"`   // output scale factor (0.5-1.0); 1.0 = full
+	MonitorID string  `json:"monitor"` // xrandr output name; "" = primary
+}
+
+// defaultCaptureParams reads the initial capture parameters from the
+// environment, falling back to the defaults. The client can override these at
+// runtime via the settings channel.
+func defaultCaptureParams() captureParams {
+	p := captureParams{
+		Bitrate: "5500",
+		Maxrate: "14400",
+		FPS:     defaultOutFPS,
+		Scale:   1.0,
+	}
+	if v := os.Getenv("SCREENRELAY_BITRATE"); v != "" {
+		p.Bitrate = v
+	}
+	if v := os.Getenv("SCREENRELAY_MAXRATE"); v != "" {
+		p.Maxrate = v
+	}
+	if v := os.Getenv("SCREENRELAY_FPS"); v != "" {
+		fmt.Sscanf(v, "%d", &p.FPS)
+	}
+	return p
+}
+
+// monitorInfo describes one connected xrandr output, as reported by the
+// "connected" line (name, resolution, position) and its active ("*+") mode
+// (refresh rate). The settings channel uses this list to let the client switch
+// which monitor is captured (RecordMonitor by monitor ID).
+type monitorInfo struct {
+	Name    string `json:"name"`    // xrandr output name, e.g. "DP-7"
+	Width   int    `json:"width"`   // active mode width
+	Height  int    `json:"height"`  // active mode height
+	X       int    `json:"x"`       // position within the virtual screen
+	Y       int    `json:"y"`
+	FPS     int    `json:"fps"`     // active mode refresh rate
+	Primary bool   `json:"primary"` // true if this is the primary output
+}
+
+// listMonitors returns the connected xrandr outputs (name, resolution, position,
+// active-mode refresh rate, primary flag). It returns an empty slice if xrandr
+// is unavailable. The order is xrandr's (primary first in practice, but not
+// guaranteed) - the client cycles through the list as-is.
+func listMonitors() []monitorInfo {
+	out, err := exec.Command("xrandr", "--query").Output()
+	if err != nil {
+		return nil
+	}
+	connectedRe := regexp.MustCompile(`^(\S+) connected(?: primary)? (\d+)x(\d+)\+(\d+)\+(\d+)`)
+	modeRe := regexp.MustCompile(`^\s*(\d+)x(\d+)\s+(\d+(?:\.\d+)?)\*\+`)
+	var mons []monitorInfo
+	var cur *monitorInfo
+	for _, line := range strings.Split(string(out), "\n") {
+		if m := connectedRe.FindStringSubmatch(line); m != nil {
+			w, _ := strconv.Atoi(m[2])
+			h, _ := strconv.Atoi(m[3])
+			x, _ := strconv.Atoi(m[4])
+			y, _ := strconv.Atoi(m[5])
+			mons = append(mons, monitorInfo{Name: m[1], Width: w, Height: h, X: x, Y: y, Primary: strings.Contains(line, "primary")})
+			cur = &mons[len(mons)-1]
+			continue
+		}
+		// A mode line: when it is the active ("*+") mode of the current output
+		// at its resolution, record its refresh rate.
+		if fm := modeRe.FindStringSubmatch(line); fm != nil && cur != nil {
+			mw, _ := strconv.Atoi(fm[1])
+			mh, _ := strconv.Atoi(fm[2])
+			if mw == cur.Width && mh == cur.Height {
+				f, _ := strconv.ParseFloat(fm[3], 64)
+				cur.FPS = int(f + 0.5)
+			}
+		}
+	}
+	return mons
+}
+
+// monitorByName returns the resolution and refresh rate of the named xrandr
+// output (an empty name selects the primary, falling back to the first
+// connected output). It returns ok=false if xrandr is unavailable or the
+// named output is not found, in which case the caller falls back to the
+// defaultWidth/defaultHeight/defaultOutFPS constants.
+func monitorByName(name string) (width, height, fps int, ok bool) {
+	if name == "" {
+		return primaryMonitor()
+	}
+	mons := listMonitors()
+	for _, m := range mons {
+		if m.Name == name {
+			if m.FPS <= 0 {
+				m.FPS = defaultOutFPS
+			}
+			return m.Width, m.Height, m.FPS, true
+		}
+	}
+	return 0, 0, 0, false
+}
 
 // Capture owns the Mutter ScreenCast session and a single GStreamer pipeline
 // that captures the screen and encodes it on the GPU (nvautogpuh264enc /
@@ -110,6 +218,14 @@ type Capture struct {
 	// with an optional peak (maxrate) for motion bursts.
 	bitrate string // target VBR bitrate in kbps, e.g. "8000"
 	maxrate string // peak bitrate in kbps allowed for motion bursts
+
+	// monitorID is the xrandr output name to record ("" = primary). A named
+	// output that cannot be found falls back to the primary. The pipeline's
+	// RecordMonitor call passes this as the monitor argument.
+	monitorID string
+	// scale is the output scale factor (0.25-1.0); 1.0 = full resolution. The
+	// pipeline's cudascale stage downscales to width x height.
+	scale float64
 
 	// gst holds the single GStreamer pipeline (capture→NVENC→raw H.264),
 	// terminated on teardown. pgid is the process-group id the pipeline runs
@@ -243,40 +359,62 @@ func virtualScreen() (vw, vh, ox, oy, pw, ph int, ok bool) {
 	return maxW, maxH, pOx, pOy, pW, pH, true
 }
 
-// newCapture builds a Capture from the actual primary monitor, constrained to
-// the maximum stream limits (maxWidth/maxHeight/maxFPS). It reads the real
-// monitor via xrandr and streams at min(actual, max): a 3440x1440@180Hz
-// monitor streams at 2560x1440@60fps. Environment overrides
-// (SCREENRELAY_WIDTH / SCREENRELAY_HEIGHT / SCREENRELAY_FPS) take precedence
-// over the monitor read.
-func newCapture() *Capture {
-	// Start from the actual primary monitor, or the defaults if xrandr is
-	// unavailable, then clamp to the maximum stream constraints.
-	rawW, rawH, rawFPS, ok := primaryMonitor()
+// newCapture builds a Capture from the given parameters. The resolution is
+// the selected monitor's (p.MonitorID, "" = primary) clamped to the maximum
+// stream constraints (maxWidth/maxHeight/maxFPS) and scaled by p.Scale (the
+// pipeline's cudascale stage does the actual downscale). The
+// SCREENRELAY_WIDTH/HEIGHT/FPS/BITRATE/MAXRATE environment variables are
+// applied as overrides on top of the params (env wins), so the initial
+// capture (from defaultCaptureParams) can still be tuned without a client.
+// A monitor that cannot be found falls back to the primary, and to the
+// defaultWidth/defaultHeight/defaultOutFPS constants if xrandr is
+// unavailable.
+func newCapture(p captureParams) *Capture {
+	c := &Capture{
+		bitrate:   p.Bitrate,
+		maxrate:   p.Maxrate,
+		outFPS:    p.FPS,
+		monitorID: p.MonitorID,
+		scale:     p.Scale,
+	}
+	
+	// Clamp the scale to a sane range (0.25 = quarter resolution, 1.0 = full).
+	if c.scale < 0.25 {
+		c.scale = 0.25
+	}
+	if c.scale > 1.0 {
+		c.scale = 1.0
+	}
+
+	// Select the monitor to record. "" = primary (fall back to the first
+	// connected output); a named output is looked up in xrandr. A monitor
+	// that cannot be found falls back to the primary.
+	rawW, rawH, rawFPS, ok := monitorByName(p.MonitorID)
 	if !ok {
+		log.Printf("capture: monitor %q not found; falling back to defaults %dx%d@%d", p.MonitorID, defaultWidth, defaultHeight, defaultOutFPS)
 		rawW, rawH, rawFPS = defaultWidth, defaultHeight, defaultOutFPS
+		c.monitorID = ""
 	}
 	if rawFPS <= 0 {
 		rawFPS = defaultOutFPS
 	}
+
 	// Clamp the actual monitor to the maximum stream constraints.
-	width, height, fps := rawW, rawH, rawFPS
-	if width > maxWidth {
-		width = maxWidth
+	c.width = rawW
+	c.height = rawH
+	// c.outFPS = rawFPS
+	if c.width > maxWidth {
+		c.width = maxWidth
 	}
-	if height > maxHeight {
-		height = maxHeight
+	if c.height > maxHeight {
+		c.height = maxHeight
 	}
-	if fps > maxFPS {
-		fps = maxFPS
+	if c.outFPS > maxFPS {
+		c.outFPS = maxFPS
 	}
-	c := &Capture{
-		width:   width,
-		height:  height,
-		outFPS:  fps,
-		bitrate: "5500",
-		maxrate: "14400",
-	}
+
+	// Environment overrides (the initial capture can be tuned without a
+	// client; the client's settings channel wins for runtime changes).
 	if v := os.Getenv("SCREENRELAY_WIDTH"); v != "" {
 		fmt.Sscanf(v, "%d", &c.width)
 	}
@@ -292,13 +430,20 @@ func newCapture() *Capture {
 	if v := os.Getenv("SCREENRELAY_MAXRATE"); v != "" {
 		c.maxrate = v
 	}
-	
-	if outputScale != 1 {
-		c.height = int(float64(c.height) * outputScale)
-		c.width = int(float64(c.width) * outputScale)
+
+	// Scale the output resolution (e.g. 0.5 = half resolution). This reduces
+	// the encode load and bandwidth at the cost of detail; the pipeline's
+	// cudascale stage does the actual downscale to c.width x c.height.
+	if c.scale != 1.0 {
+		c.height = int(float64(c.height) * c.scale)
+		c.width = int(float64(c.width) * c.scale)
 	}
-	log.Printf("capture: primary monitor %dx%d@%dHz -> stream %dx%d@%d fps (max %dx%d@%d, scale %d)",
-		rawW, rawH, rawFPS, c.width, c.height, c.outFPS, maxWidth, maxHeight, maxFPS, outputScale)
+	log.Printf("capture: monitor %q %dx%d@%dHz -> stream %dx%d@%d fps (max %dx%d@%d, scale %.2f, bitrate %skbps, maxrate %skbps)",
+		p.MonitorID, rawW, rawH, rawFPS, c.width, c.height, c.outFPS, maxWidth, maxHeight, maxFPS, c.scale, c.bitrate, c.maxrate)
+
+	log.Printf("capture FPS: %d source - %d param - %d capture - %d max", rawFPS, p.FPS, c.outFPS, maxFPS)
+
+
 	return c
 }
 
@@ -333,15 +478,20 @@ func (c *Capture) run(rs *RelayServer) bool {
 	defer sessionObj.Call("org.gnome.Mutter.ScreenCast.Session.Stop", 0)
 	c.obj = sessionObj
 
-	// Record the monitor (cursor-mode = 1 = with-cursor).
+	// Record the monitor (cursor-mode = 0 = no cursor).
+	// so we don't see that lag in the cursor input
 	var streamPath dbus.ObjectPath
 	recordProps := map[string]dbus.Variant{
-		"cursor-mode": dbus.MakeVariant(uint32(1)),
+		"cursor-mode": dbus.MakeVariant(uint32(0)),
 	}
+	// The monitor argument
+	// is the xrandr output name to capture ("" = the primary monitor). This is
+	// how the settings channel's display switch works: a new capture is
+	// started with the selected monitor's name.
 	if err := sessionObj.Call(
-		"org.gnome.Mutter.ScreenCast.Session.RecordMonitor", 0, "", recordProps).
+		"org.gnome.Mutter.ScreenCast.Session.RecordMonitor", 0, c.monitorID, recordProps).
 		Store(&streamPath); err != nil {
-		log.Printf("capture: RecordMonitor failed: %v", err)
+		log.Printf("capture: RecordMonitor (monitor %q) failed: %v", c.monitorID, err)
 		return false
 	}
 
@@ -518,6 +668,12 @@ func (c *Capture) launch(rs *RelayServer) bool {
 	//     pump exits so any trailing fragment is flushed.
 	muxer := newFmp4Muxer(c.outFPS, func(boxGroup []byte) {
 		rs.stream.write(boxGroup)
+	}, func(initSeg []byte) {
+		// Store the init segment for late-joining /stream subscribers and
+		// broadcast it to current subscribers (they already have it via emit,
+		// so this is a no-op for them; new subscribers get it via
+		// rs.stream.serveInit when they register).
+		rs.storeInitSegment(initSeg)
 	})
 	c.muxer = muxer
 	acc := newAccessUnitAccumulator()
@@ -536,10 +692,10 @@ func (c *Capture) launch(rs *RelayServer) bool {
 		now := time.Now()
 		if !c.lastAU.IsZero() {
 			gap := now.Sub(c.lastAU).Seconds() * 1000
-			if gap > 50 {
-				log.Printf("capture: AU gap %.1fms size=%d - encoder held a frame",
-					gap, len(au))
-			}
+			// if gap > 50 {
+			// 	log.Printf("capture: AU gap %.1fms size=%d - encoder held a frame",
+			// 		gap, len(au))
+			// }
 			c.dbgArrivalWindow = append(c.dbgArrivalWindow, gap)
 			if len(c.dbgArrivalWindow) > 300 {
 				c.dbgArrivalWindow = c.dbgArrivalWindow[1:]

@@ -59,6 +59,11 @@ func main() {
 	mux.Handle("/raw", relay)
 	mux.Handle("/stream", relay)
 	mux.Handle("/relay", relay)
+	// Live audio (opus packets over WebSocket; the client decodes with
+	// WebCodecs AudioDecoder and plays through an AudioContext).
+	mux.Handle("/audio", relay)
+	// Read-only monitor list for the client's display-switching control.
+	mux.Handle("/monitors", relay)
 
 	srv := &http.Server{
 		Addr:    cfg.Addr,
@@ -83,6 +88,9 @@ func main() {
 	if cfg.DisableCapture {
 		log.Printf("WARNING: SCREENRELAY_DISABLE_CAPTURE set; serving control channel only (no capture)")
 	}
+	if cfg.DisableAudio {
+		log.Printf("WARNING: SCREENRELAY_DISABLE_AUDIO set; /audio WS connects but no audio pipeline starts")
+	}
 	log.Printf("video: browser connects to /raw (raw H.264 via WebCodecs, primary) or /stream (progressive fMP4 via MediaSource, fallback) and /relay (WS control channel)")
 
 	if err := srv.ListenAndServe(); err != nil {
@@ -100,6 +108,10 @@ type config struct {
 	// channel, which lets a browser client connect for testing without spinning
 	// up the (heavy) capture pipeline.
 	DisableCapture bool
+	// DisableAudio, when true, makes ServeAudio skip the audio pipeline
+	// entirely (no pulsesrc/opusenc GStreamer). The /audio WS still
+	// connects but stays silent.
+	DisableAudio bool
 }
 
 func loadConfig() config {
@@ -113,12 +125,14 @@ func loadConfig() config {
 	}
 	bearer := os.Getenv("SCREENRELAY_BEARER")
 	disableCapture := os.Getenv("SCREENRELAY_DISABLE_CAPTURE") != ""
+	disableAudio := os.Getenv("SCREENRELAY_DISABLE_AUDIO") != ""
 
 	return config{
 		Addr:           addr,
 		ClientDir:      clientDir,
 		Bearer:         bearer,
 		DisableCapture: disableCapture,
+		DisableAudio:   disableAudio,
 	}
 }
 

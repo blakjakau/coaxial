@@ -10,7 +10,7 @@
 			html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
 			  font-family: system-ui, sans-serif; overflow: hidden; }
 			#stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
-			#video, #canvas { max-width: 100%; max-height: 100%; display: block; image-rendering: optimizeSpeed; }
+			#video, #canvas { max-width: 100%; max-height: 100%; display: block; image-rendering: optimizeSpeed; width:100%}
 			#canvas { background: #000; }
 			#stage.fmp4-mode #canvas { display: none; }
 			#stage.raw-mode #video { display: none; }
@@ -19,10 +19,42 @@
 			  margin-right: 6px; border-radius: 50%; background: var(--muted); vertical-align: middle; }
 			#status.ok::before { background: var(--ok); }
 			#status.err::before { background: var(--bad); }
-			#hint { position: fixed; bottom: 8px; left: 8px; font-size: 11px; color: var(--muted); }
+			/* bottom: 64px clears the performance overlay (bottom-left, ~56px tall). */
+			#hint { position: fixed; bottom: 64px; left: 8px; font-size: 11px; color: var(--muted); }
 			#start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
 			  cursor: pointer; background: rgba(16, 20, 24, 0.9); font-size: 18px; color: var(--fg); }
 			#start.hidden { display: none; }
+			/* Settings bar (bottom-right): a row of vector-icon buttons. */
+			#bar { position: fixed; bottom: 8px; right: 8px; display: flex; gap: 4px; padding: 4px;
+			  background: rgba(22, 27, 34, 0.85); border: 1px solid rgba(139, 148, 158, 0.25);
+			  border-radius: 8px; backdrop-filter: blur(4px); z-index: 20; }
+			#bar button { width: 34px; height: 34px; padding: 6px; border: none; border-radius: 6px;
+			  background: transparent; color: var(--muted); cursor: pointer; display: flex;
+			  align-items: center; justify-content: center; }
+			#bar button:hover { background: rgba(139, 148, 158, 0.15); color: var(--fg); }
+			#bar button.active { color: var(--ok); background: rgba(63, 185, 80, 0.12); }
+			#bar button:disabled { opacity: 0.4; cursor: default; }
+			#bar button svg { width: 100%; height: 100%; } /* size via the button's padding */
+			#bar-label { position: fixed; bottom: 52px; right: 8px; font-size: 12px; color: var(--fg);
+			  background: rgba(22, 27, 34, 0.9); padding: 4px 10px; border-radius: 6px;
+			  opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 20; }
+			#bar-label.show { opacity: 1; }
+			/* Splash screen: the Coaxial logo, centered, faded out after the first frame. */
+			/* pointer-events: none so the splash never intercepts the "Click to start"
+			   overlay beneath it (fMP4 mode needs that click to begin playback). */
+			#splash { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+			  background: var(--bg); z-index: 30; transition: opacity 0.6s; pointer-events: none; }
+			#splash img { width: 240px; max-width: 60vw; }
+			#splash.hidden { opacity: 0; pointer-events: none; }
+			/* Performance overlay (bottom-left): FPS + bandwidth, each with a 30s sparkline. */
+			#perf { position: fixed; bottom: 8px; left: 8px; display: flex; flex-direction: row; gap: 4px;
+			  padding: 6px 8px; background: rgba(22, 27, 34, 0.85); border: 1px solid rgba(139, 148, 158, 0.25);
+			  border-radius: 8px; z-index: 20; font-family: monospace; font-size: 11px; }
+			#perf.hidden { display: none; }
+			#perf .row { display: flex; align-items: center; gap: 8px; }
+			#perf .label { color: var(--muted); width: 34px; }
+			#perf .val { color: var(--fg); width: 44px; text-align: right; }
+			#perf canvas { display: block; }
 		</style>
 	</head>
 	<body>
@@ -30,9 +62,58 @@
 		<div id="stage">
 			<video id="video" playsinline></video>
 			<canvas id="canvas"></canvas>
-		</div>
 		<div id="start">Click to start</div>
 		<div id="hint">Screen Relay</div>
+		<div id="bar">
+			<button id="btn-capture" title="Capture input (pointer lock, Ctrl+Shift+L)">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M12 2v4" /><path d="M12 18v4" /><path d="M2 12h4" /><path d="M18 12h4" />
+					<circle cx="12" cy="12" r="4" />
+				</svg>
+			</button>
+			<button id="btn-quality" title="Stream quality (low / med / high)">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M3 20h18" /><path d="M6 20v-6" /><path d="M11 20V8" /><path d="M16 20v-9" /><path d="M21 20V4" />
+				</svg>
+			</button>
+			<button id="btn-fps" title="Framerate (15/24/30/45/60)">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 3" />
+				</svg>
+			</button>
+			<button id="btn-scale" title="Output scale (1.0 / 0.75 / 0.5)">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M4 4h16v16H4z" /><path d="M14 4v16" /><path d="M4 14h16" opacity="0.4" />
+				</svg>
+			</button>
+			<button id="btn-display" title="Switch display (primary / monitor)">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<rect x="2" y="4" width="20" height="13" rx="1" /><path d="M8 21h8" /><path d="M12 17v4" />
+				</svg>
+			</button>
+			<button id="btn-audio" title="Relay audio (opus over WS → WebCodecs)">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M4 9v6h4l5 4V5L8 9z" /><path d="M16 9a3 3 0 0 1 0 6" /><path d="M18.5 7a6 6 0 0 1 0 10" />
+				</svg>
+			</button>
+			<button id="btn-fullscreen" title="Fullscreen">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M4 9V4h5" /><path d="M20 9V4h-5" /><path d="M4 15v5h5" /><path d="M20 15v5h-5" />
+				</svg>
+			</button>
+			<button id="btn-perf" title="Performance overlay (fps + bandwidth)">
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M3 12h4l3 8 4-16 3 8h4" />
+				</svg>
+			</button>
+		</div>
+		<div id="bar-label"></div>
+		<div id="perf" class="hidden">
+			<div class="row"><span class="label">fps</span><span class="val" id="perf-fps-val">0</span><canvas id="perf-fps-graph" width="120" height="24"></canvas></div>
+			<div class="row"><span class="label">kbps</span><span class="val" id="perf-bw-val">0</span><canvas id="perf-bw-graph" width="120" height="24"></canvas></div>
+		</div>
+		</div>
+		<div id="splash"><img src="images/coaxial-colour.svg" alt="Coaxial" /></div>
 		<script src="app.js"></script>
 	</body>
 </html>

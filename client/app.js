@@ -81,6 +81,9 @@ let rawConfigFailures = 0
 let rawFrameIndex = 0
 // rawDecoded counts frames rendered to the canvas (diagnostics).
 let rawDecoded = 0
+// rawBytes counts bytes received over the /raw socket (bandwidth metric for the
+// performance overlay, sampled per second alongside rawDecoded).
+let rawBytes = 0
 // rawInFlight = frames submitted to decoder.decode() but not yet returned via
 // the output() callback (self-tracked, because VideoDecoder exposes no
 // frameQueueSize - that is an MSE SourceBuffer property, not a WebCodecs one).
@@ -88,6 +91,60 @@ let rawDecoded = 0
 // the ~260ms decode latency = rawInFlight x frame interval. This is the metric
 // that tracks the pipeline depth while tuning res/fps/bitrate.
 let rawInFlight = 0
+// --- Audio path (Phase 4) ---
+// audioSocket is the /audio WebSocket (one binary message per opus packet).
+let audioSocket = null
+// audioDecoder is the WebCodecs AudioDecoder for the opus stream.
+let audioDecoder = null
+// audioCtx is the AudioContext that plays decoded PCM. It is created on the
+// first audio button press (an AudioContext cannot start before a user
+// gesture; the button click is that gesture).
+let audioCtx = null
+// audioNextStartTime is the AudioContext time at which the next decoded
+// buffer is scheduled (a monotonic playback clock; each decoded buffer is
+// scheduled at audioNextStartTime and the clock advances by the buffer's
+// duration).
+let audioNextStartTime = 0
+// audioTs is the opus packet timestamp counter (microseconds). The server
+// sends bare opus packets (no PTS), so the client assigns a monotonic PTS
+// per packet. opusenc at 32kbps emits one packet per 20ms frame, so each
+// packet advances the clock by 20000us.
+let audioTs = 0
+// audioFirstFrame tracks whether the next opus packet to be decoded is the
+// FIRST one for the current decoder. Chrome's WebCodecs opus decoder
+// initializes its internal state from the first frame, and that frame must be
+// marked type:"key" (opus has no real keyframes, but the decoder needs a
+// "key" chunk to start); every subsequent frame is type:"delta". Feeding the
+// first frame as "delta" makes the decoder reject the ENTIRE stream with a
+// DataError (verified empirically: all-delta -> 0/200 decoded, key-first ->
+// 200/200). Reset to true whenever a new decoder is created (ensureAudioPath).
+let audioFirstFrame = true
+// audioReconnectTimer guards the audio-path reconnect (single-flight, like
+// rawReconnectTimer).
+let audioReconnectTimer = null
+// audioEnabled is the user's audio on/off preference (the button's active
+// state). When true, the /audio socket is open and decoding.
+let audioEnabled = false
+// --- Audio diagnostics (temporary; remove once audio is confirmed working) ---
+// audioDiag counts packets received / decoded / scheduled so the console log
+// (every 2s while audio is on) shows whether the break is in the socket
+// (no packets), the decoder (packets but no output), or playback (output but
+// nothing scheduled). audioDiagZero reports whether the last decoded chunk
+// contained any non-zero sample (a silent monitor source produces all-zero
+// PCM, which plays as silence).
+let audioDiag = { pkt: 0, sizes: [], decoded: 0, chunks: [], scheduled: 0, zero: 0, ctxState: "", decodeErr: null, closeErr: null, head: null }
+let audioHead = null // last OpusHead received from the server (stream channels + rate)
+let audioHeadApplied = false // whether the decoder has been (re)configured from the head
+// Prefix the server prepends to the OpusHead re-emit message so a client can
+// distinguish it from a bare opus audio packet on the same binary channel.
+const AUDIO_HEAD_PREFIX = "AUDIOHEAD:"
+function isAudioHeadMsg(pkt) {
+	const n = AUDIO_HEAD_PREFIX.length
+	if (pkt.length < n) return false
+	for (let i = 0; i < n; i++) if (pkt[i] !== AUDIO_HEAD_PREFIX.charCodeAt(i)) return false
+	return true
+}
+let audioDiagTimer = null
 // Per-frame debug records (capped at DBG_KEEP). Each record is ONE frame and
 // carries its three wall-clock timestamps (performance.now(), ms) TOGETHER so
 // the on-canvas overlay and the click-to-copy report can show PER-FRAME
@@ -248,6 +305,8 @@ async function attachVideo() {
 	ms.addEventListener("error", () => {
 		setStatus("err", "media source error")
 	})
+	// First fMP4 frame visible (playback started): fade out the splash screen.
+	video.addEventListener("playing", hideSplash, { once: true })
 }
 
 // parseNals splits an Annex-B access unit into its NAL units. Each unit is
@@ -529,17 +588,17 @@ function buildDebugReport() {
 // has no other click handler in raw mode, so this is safe to bind once. The
 // clipboard write is best-effort (navigator.clipboard needs a secure context +
 // the click gesture); the console copy always works as a fallback.
-let debugCopyWired = false
+let debugCopyWired = true
 function wireDebugCopy() {
 	if (debugCopyWired) return
 	debugCopyWired = true
 	const c = document.getElementById("canvas")
 	c.addEventListener("click", () => {
 		const report = buildDebugReport()
-		console.log("raw debug (last " + DBG_SHOW + " frames):\n" + report)
+		console.debug&&console.debug("raw debug (last " + DBG_SHOW + " frames):\n" + report)
 		if (navigator.clipboard && navigator.clipboard.writeText) {
 			navigator.clipboard.writeText(report).then(
-				() => console.log("raw debug copied to clipboard"),
+				() => console.debug&&console.debug("raw debug copied to clipboard"),
 				(e) => console.warn("clipboard copy failed:", e)
 			)
 		}
@@ -609,6 +668,8 @@ async function ensureRawPath() {
 	sock.onmessage = (ev) => {
 		const au = new Uint8Array(ev.data)
 		if (au.length < 5) return
+		// Performance overlay: count the received bytes (bandwidth metric).
+		if (perfOn) perfBytes += au.length
 		// Record the access-unit ARRIVAL timestamp (the WebSocket delivered
 		// this AU). It is queued in dbgPendingArrivals and paired with the
 		// matching decoder output (shifted in output()). The arrival cadence
@@ -637,7 +698,7 @@ async function ensureRawPath() {
 			}
 			if (!hasSps) return // delta slice; no config possible yet.
 			const codec = await buildDecoderConfig(au)
-			console.log(codec)
+			console.debug&&console.debug(codec)
 			// A competing access unit may have configured the decoder while we
 			// were awaiting (the pre-config branch is fire-and-forget). Only the
 			// first to reach this point creates the decoder + primes it.
@@ -703,7 +764,11 @@ async function ensureRawPath() {
 					rec.cad = prevBlit ? now - prevBlit : undefined
 				}
 				prevBlit = now
-				drawDebugOverlay(ctx, w, h)
+				//drawDebugOverlay(ctx, w, h)
+				// First frame visible: fade out the splash screen.
+				hideSplash()
+				// Performance overlay: count this blit as a rendered frame.
+				if (perfOn) perfFrames++
 			}
 			decoder = new VideoDecoder({
 				output: (frame) => {
@@ -786,7 +851,7 @@ async function ensureRawPath() {
 					hardwareAcceleration: "prefer-software" 
 				})
 			rawConfigured = true
-			console.log("raw: decoder configured:", codec)
+			console.debug&&console.debug("raw: decoder configured:", codec)
 			// Prime the decoder with THIS access unit. The SPS-carrying AU is
 			// the IDR frame (the server groups SPS/PPS into the same AU as the
 			// IDR slice), and WebCodecs requires the first chunk after
@@ -856,6 +921,400 @@ async function ensureRawPath() {
 
 	sock.onerror = () => {
 		setStatus("err", "raw stream error")
+	}
+}
+
+// toggleAudio flips the audio relay on or off. Enabling opens the /audio
+// WebSocket and starts the WebCodecs AudioDecoder; disabling tears the path
+// down (socket, decoder, AudioContext suspended). The AudioContext is created
+// here (inside the button click) because an AudioContext cannot start before
+// a user gesture.
+async function toggleAudio() {
+	if (audioEnabled) {
+		closeAudioPath()
+		audioEnabled = false
+		const btn = document.getElementById("btn-audio")
+		if (btn) btn.classList.remove("active")
+		return
+	}
+	// The audio path needs WebCodecs AudioDecoder (the video path already
+	// requires it in raw mode; fMP4 mode may run in a browser without it).
+	if (typeof AudioDecoder === "undefined") {
+		console.warn("audio: WebCodecs AudioDecoder not available")
+		return
+	}
+	// The audio path also needs an AudioContext (Web Audio API).
+	if (typeof AudioContext === "undefined") {
+		console.warn("audio: AudioContext not available")
+		return
+	}
+	// User gesture: create/resume the AudioContext now (autoplay policy).
+	if (!audioCtx) {
+		audioCtx = new AudioContext()
+		audioNextStartTime = 0
+	}
+	if (audioCtx.state === "suspended") {
+		await audioCtx.resume()
+	}
+	audioEnabled = true
+	const btn = document.getElementById("btn-audio")
+	if (btn) btn.classList.add("active")
+	// DIAG: reset the counters and log a summary every 2s while audio is on.
+	// pkt = packets received from the socket; decoded = chunks the decoder
+	// emitted; scheduled = buffers scheduled on the AudioContext; zero =
+	// decoded chunks that were all-zero (silence). A healthy stream shows all
+	// three counters advancing at ~50/s (20ms opus packets); zero should be
+	// ~0 if the host is producing sound.
+	audioDiag = { pkt: 0, sizes: [], decoded: 0, chunks: [], scheduled: 0, zero: 0, ctxState: audioCtx ? audioCtx.state : "", head: null, headSeen: 0, keyFrames: 0, layout: null }
+	audioHead = null
+	audioHeadApplied = false
+	if (audioDiagTimer) clearInterval(audioDiagTimer)
+	audioDiagTimer = setInterval(() => {
+	console.debug&&console.debug(
+			"audio diag:",
+			JSON.stringify({
+				pkt: audioDiag.pkt,
+				decoded: audioDiag.decoded,
+				scheduled: audioDiag.scheduled,
+				zero: audioDiag.zero,
+				ctx: audioCtx ? audioCtx.state : "null",
+				dest: audioCtx ? audioCtx.destination.channelCount : "?",
+				decoder: audioDecoder ? audioDecoder.state : "null",
+				head: audioDiag.head,
+				headSeen: audioDiag.headSeen,
+				keyFrames: audioDiag.keyFrames,
+				layout: audioDiag.layout,
+				sizes: audioDiag.sizes.length ? audioDiag.sizes : "(no packets)",
+				chunks: audioDiag.chunks.length ? audioDiag.chunks : "(no output)",
+				decodeErr: audioDiag.decodeErr,
+				closeErr: audioDiag.closeErr,
+			})
+		)
+	}, 2000)
+	ensureAudioPath()
+}
+
+// ensureAudioPath opens the /audio WebSocket and starts the WebCodecs
+// AudioDecoder for the opus stream. Each binary message is one opus packet;
+// it is fed to the decoder with a monotonic PTS (audioTs, +20000us per
+// packet). Decoded PCM is scheduled onto the AudioContext at
+// audioNextStartTime.
+async function ensureAudioPath() {
+	if (!audioEnabled) return
+	const token = await fetchToken()
+	const protocol = location.protocol === "https:" ? "wss" : "ws"
+	const url = `${protocol}://${location.host}/audio${token ? `?token=${encodeURIComponent(token)}` : ""}`
+	const sock = new WebSocket(url)
+	sock.binaryType = "arraybuffer"
+	audioSocket = sock
+
+	// Configure the AudioDecoder for opus. The server encodes at 48kHz
+	// (audioconvert/audioresample -> 48000), so the decoder is configured for
+	// 48kHz. The channel count is left to the decoder (opus is mono or
+	// stereo; the server's audioconvert normalizes to 2ch, but the decoder
+	// handles both).
+	if (audioDecoder) {
+		try {
+			audioDecoder.close()
+		} catch (e) {
+			// already closed; ignore.
+		}
+		audioDecoder = null
+	}
+	audioTs = 0
+	audioNextStartTime = 0
+	audioHead = null
+	audioHeadApplied = false
+	// New decoder: the next opus packet is its first frame (type:"key").
+	audioFirstFrame = true
+	audioDecoder = new AudioDecoder({
+			output: (chunk) => {
+				playAudioData(chunk)
+			},
+			error: (e) => {
+				// DIAG: capture the async decode error (invalid opus packet, etc.)
+				// so the 2s summary shows it even if the console scroll lost it.
+				audioDiag.closeErr = e ? (e.name + ": " + e.message) : String(e)
+				// Allow a later OpusHead to (re)configure this decoder: a
+				// config-mismatch DataError that closed the decoder is cured by
+				// reconfiguring to the stream's real channels/rate.
+				audioHeadApplied = false
+				console.warn("audio: decoder error:", e)
+			},
+			// DIAG: onclose fires when the decoder transitions to "closed" (an
+			// error, or an explicit close). Without this, a dead decoder is
+			// silent - the socket keeps feeding, the state guard returns early,
+			// and nothing ever plays again.
+			onclose: () => {
+				console.warn("audio: decoder closed (state -> closed); will not decode further")
+			},
+		})
+	// Configure the decoder from the stream's ACTUAL OpusHead (channel count +
+	// sample rate) rather than a hard-coded 48kHz/2ch guess. WebCodecs requires
+	// codec, sampleRate, and numberOfChannels (all required members of
+	// AudioDecoderConfig), and the config MUST match the stream exactly or
+	// every decode throws a DataError. applyAudioHead is called with the
+	// server's OpusHead (re-emitted to every subscriber, like the fMP4 init
+	// segment); until the head arrives the decoder stays unconfigured and
+	// onmessage skips audio packets (it only decodes when state ===
+	// "configured"). The head is the first message on the audio channel, so
+	// this is a one-time setup, not a per-packet stall.
+	function applyAudioHead(head) {
+		if (!audioDecoder || audioDecoder.state === "closed") return
+		let channels = 2, sampleRate = 48000
+		// OpusHead (RFC 3533 / oggopus, 19 bytes): "OpusHead"(0-7) version(8)
+		// channel_count(9) pre_skip(10-11 LE) output_sample_rate(12-15 LE)
+		// gain(16-17) mapping_family(18). channel_count: 1 = mono, 2 = stereo.
+		if (head && head.length >= 16) {
+			const b = new DataView(head.buffer, head.byteOffset, head.byteLength)
+			channels = head[9]
+			if (channels < 1) channels = 1
+			if (channels > 2) channels = 2 // WebCodecs opus: 1 or 2 channels
+			sampleRate = b.getUint32(12, true) // 0 = unspecified -> 48000
+			if (!sampleRate) sampleRate = 48000
+		}
+		audioDiag.head = { channels, sampleRate }
+		// configure() only returns a Promise while the decoder is
+		// "unconfigured"; on any other state it returns undefined (or throws),
+		// and a closed decoder cannot be reconfigured in place at all. So only
+		// configure from the "unconfigured" state (the head is the first
+		// message on the channel, so this is a one-time setup); duplicate head
+		// messages (the server re-emits the cached head to new subscribers AND
+		// fans out the live head) are ignored once configured.
+		if (audioDecoder.state !== "unconfigured") return
+		audioHeadApplied = true
+		const ret = audioDecoder.configure({
+			codec: "opus",
+			sampleRate,
+			numberOfChannels: channels,
+		})
+		const p = ret && typeof ret.then === "function" ? ret : Promise.resolve()
+		p
+			.then(() =>
+				console.debug&&console.debug(
+					"audio: decoder configured from OpusHead:",
+					sampleRate + "Hz " + channels + "ch"
+				)
+			)
+			.catch((e) => {
+				console.warn("audio: decoder configure failed:", e)
+				audioDiag.decodeErr = e ? e.name + ": " + e.message : String(e)
+			})
+	}
+	if (audioHead) applyAudioHead(audioHead) // head already received before decoder existed (rare)
+
+	sock.onopen = () => {
+		if (audioReconnectTimer) {
+			clearTimeout(audioReconnectTimer)
+			audioReconnectTimer = null
+		}
+	}
+
+		sock.onmessage = (ev) => {
+			const pkt = new Uint8Array(ev.data)
+			// The server re-emits the OpusHead (prefixed "AUDIOHEAD:") to every
+			// subscriber before/alongside audio packets. Detect it, configure the
+			// decoder to the stream's ACTUAL channels/rate, and skip the rest of
+			// the handler (the head is not an opus packet).
+			if (isAudioHeadMsg(pkt)) {
+				const head = pkt.subarray(AUDIO_HEAD_PREFIX.length)
+				if (head.length >= 19) {
+					audioHead = head.slice() // copy: ev.data buffer is reusable
+					audioDiag.headSeen++
+					if (audioDiag.headSeen === 1) {
+						// DIAG: log the first head's raw bytes + parsed values
+						// so a config mismatch is visible without guessing.
+						const h = audioHead
+						const dv = new DataView(h.buffer, h.byteOffset, h.byteLength)
+						console.debug&&console.debug(
+							"audio: head received:",
+							Array.from(h.slice(0, 19)),
+							"-> channels=" + h[9] +
+								" sampleRate=" + dv.getUint32(12, true)
+						)
+					}
+					applyAudioHead(audioHead)
+					return
+				}
+			}
+			// DIAG: record the first 10 packet sizes (a healthy opus stream is
+			// ~10-100 bytes per 20ms packet; tiny ~2-4 byte packets mean a silent
+			// source; a steady size with no decoder output means the decoder is
+			// rejecting them).
+			if (audioDiag.pkt < 10) audioDiag.sizes.push(pkt.length)
+			audioDiag.pkt++
+			if (!audioDecoder || audioDecoder.state !== "configured") return
+		// Feed the packet with a monotonic PTS. opusenc emits one packet per
+		// 20ms frame, so each packet advances the clock by 20000us.
+		//
+		// Chunk type: the FIRST frame for a decoder must be type:"key" —
+		// Chrome's opus decoder initializes its internal state from it.
+		// Feeding the first frame as "delta" makes the decoder reject the
+		// ENTIRE stream with a DataError (verified empirically: all-delta ->
+		// 0/200 decoded, key-first -> 200/200). Every subsequent frame is
+		// type:"delta" (opus frames are independently decodable).
+		const chunkType = audioFirstFrame ? "key" : "delta"
+		try {
+			audioDecoder.decode(
+				new EncodedAudioChunk({
+					type: chunkType,
+					timestamp: audioTs,
+					data: pkt,
+				})
+			)
+			// DIAG: count key frames (should be exactly 1 per decoder session;
+			// >1 means a decode() threw and the next packet retried as "key").
+			if (chunkType === "key") audioDiag.keyFrames++
+			// The decoder accepted this chunk; it is no longer the first
+			// frame. If decode() threw, audioFirstFrame stays true so the
+			// next packet retries as a "key" frame.
+			audioFirstFrame = false
+			audioTs += 20000
+		} catch (e) {
+			// DIAG: log the FULL error (name + message). The message tail after
+			// "on 'AudioDecoder':" is the actual reason (e.g. "The AudioDecoder
+			// is closed." / "not configured."). Also capture it for the 2s
+			// summary so it isn't lost in console scroll.
+			const msg = e ? (e.name + ": " + e.message) : String(e)
+			if (audioDiag.decodeErr !== msg) {
+				audioDiag.decodeErr = msg
+				console.warn("audio: decode failed:", msg)
+			}
+		}
+	}
+
+	sock.onclose = () => {
+		if (!audioEnabled) return // user turned audio off; don't reconnect.
+		audioSocket = null
+		// Reconnect with a short backoff (single-flight).
+		if (audioReconnectTimer) return
+		audioReconnectTimer = setTimeout(() => {
+			audioReconnectTimer = null
+			if (audioEnabled && !closed) ensureAudioPath()
+		}, 1000)
+	}
+
+	sock.onerror = () => {
+		console.warn("audio: socket error")
+	}
+}
+
+// playAudioData schedules a decoded PCM buffer onto the AudioContext at
+// audioNextStartTime and advances the playback clock by the buffer's
+// duration. The buffer is a copy (AudioBuffer is immutable once created);
+// the decoded chunk is closed after the copy.
+function playAudioData(chunk) {
+	if (!audioCtx || chunk.numberOfFrames === 0) {
+		chunk.close()
+		return
+	}
+	const sampleRate = chunk.sampleRate || 48000
+	const numChannels = chunk.numberOfChannels
+	const numFrames = chunk.numberOfFrames
+	// DIAG: record the first 5 decoded chunks (sampleRate/channels/frames
+	// must match the decoder config: 48000/2/960 for opus at 48kHz).
+	if (audioDiag.decoded < 5) {
+		audioDiag.chunks.push({ sr: sampleRate, ch: numChannels, fr: numFrames })
+	}
+	// AudioData.copyTo(destination, options) REQUIRES the options argument in
+	// Chrome (even though the spec marks it optional). The decoded sample
+	// LAYOUT is implementation-defined: "interleaved" (one plane, samples
+	// [L0,R0,L1,R1,...]) or "planar" (one plane per channel, each of length
+	// numFrames). Handle both, driven by chunk.layout, and log the layout on
+	// the first chunk so a wrong assumption is visible without guessing.
+	const layout = chunk.layout
+	if (audioDiag.decoded === 0) {
+		audioDiag.layout = layout
+		console.debug&&console.debug(
+			"audio: decoded PCM layout:",
+			layout,
+			"ch=" + numChannels,
+			"frames=" + numFrames,
+			"sr=" + sampleRate
+		)
+	}
+	// DIAG: check whether the chunk is all-zero (a silent monitor source
+	// decodes to all-zero PCM, which plays as silence). The probe must match
+	// plane 0's size: interleaved -> all samples (numFrames * numChannels);
+	// planar -> the first channel (numFrames).
+	{
+		const probeLen = layout === "planar" ? numFrames : numFrames * numChannels
+		const probe = new Float32Array(probeLen)
+		chunk.copyTo(probe, { planeIndex: 0 })
+		let nonzero = false
+		for (let i = 0; i < probe.length; i++) {
+			if (probe[i] !== 0) { nonzero = true; break }
+		}
+		if (!nonzero) audioDiag.zero++
+	}
+	audioDiag.decoded++
+	// Copy the PCM into an AudioBuffer (the decoded chunk is closed after).
+	const buffer = audioCtx.createBuffer(numChannels, numFrames, sampleRate)
+	if (layout === "planar") {
+		// One plane per channel; each plane is numFrames long.
+		for (let ch = 0; ch < numChannels; ch++) {
+			const data = new Float32Array(numFrames)
+			chunk.copyTo(data, { planeIndex: ch })
+			buffer.copyToChannel(data, ch)
+		}
+	} else {
+		// Interleaved: a single plane of length numFrames * numChannels
+		// ([L0,R0,L1,R1,...]); de-interleave into the per-channel planes.
+		const interleaved = new Float32Array(numFrames * numChannels)
+		chunk.copyTo(interleaved, { planeIndex: 0 })
+		for (let ch = 0; ch < numChannels; ch++) {
+			const data = new Float32Array(numFrames)
+			for (let i = 0; i < numFrames; i++) {
+				data[i] = interleaved[i * numChannels + ch]
+			}
+			buffer.copyToChannel(data, ch)
+		}
+	}
+	chunk.close()
+	audioDiag.scheduled++
+	// Schedule the buffer at audioNextStartTime (or now if the clock is
+	// behind, e.g. after a gap).
+	const now = audioCtx.currentTime
+	if (audioNextStartTime < now) {
+		audioNextStartTime = now
+	}
+	const src = audioCtx.createBufferSource()
+	src.buffer = buffer
+	src.connect(audioCtx.destination)
+	src.start(audioNextStartTime)
+	audioNextStartTime += buffer.duration
+}
+
+// closeAudioPath tears down the audio path: closes the socket, the decoder,
+// and suspends the AudioContext (the context is kept so a re-enable doesn't
+// have to recreate it; the button click resumes it).
+function closeAudioPath() {
+	if (audioDiagTimer) {
+		clearInterval(audioDiagTimer)
+		audioDiagTimer = null
+	}
+	if (audioReconnectTimer) {
+		clearTimeout(audioReconnectTimer)
+		audioReconnectTimer = null
+	}
+	if (audioSocket) {
+		try {
+			audioSocket.close()
+		} catch (e) {
+			// already closed; ignore.
+		}
+		audioSocket = null
+	}
+	if (audioDecoder) {
+		try {
+			audioDecoder.close()
+		} catch (e) {
+			// already closed; ignore.
+		}
+		audioDecoder = null
+	}
+	if (audioCtx) {
+		audioCtx.suspend()
 	}
 }
 
@@ -1025,12 +1484,20 @@ async function startStreamPipeline(video, url, ms) {
 			}
 		}
 
-		let res = null
-		let reader = null
-		let stallPromise = null
-		const markByte = () => {
-			lastByte = Date.now()
+	let res = null
+	let reader = null
+	let stallPromise = null
+	// gotFirstByte hides the splash on the first chunk of stream data (the
+	// "Click to start" overlay becomes visible; the user click is what starts
+	// playback per the autoplay policy).
+	let gotFirstByte = false
+	const markByte = () => {
+		lastByte = Date.now()
+		if (!gotFirstByte) {
+			gotFirstByte = true
+			hideSplash()
 		}
+	}
 
 		// watchdog fires the current fetch's stall reject (fetchStallReject)
 		// once no bytes have arrived for stallTimeout. It is raced against
@@ -1075,6 +1542,8 @@ async function startStreamPipeline(video, url, ms) {
 					const { done, value } = await Promise.race([reader.read(), stallPromise])
 					if (done) break
 					markByte()
+					// Performance overlay: count the received bytes (bandwidth metric).
+					if (perfOn) perfBytes += value.length
 					// A SourceBuffer update wedged (still updating) for
 					// stallTimeout means the append pipeline is frozen; rebuild
 					// it on a fresh MediaSource. (Checked here because bytes
@@ -1136,7 +1605,7 @@ async function startStreamPipeline(video, url, ms) {
 				} catch (e) {
 					// reader already released; ignore.
 				}
-				console.log("stream ended (server FIN); re-fetching on the same pipeline")
+				console.debug&&console.debug("stream ended (server FIN); re-fetching on the same pipeline")
 			}
 		} catch (e) {
 			console.error("stream pipeline failed:", e)
@@ -1253,6 +1722,9 @@ async function openSocket() {
 				break
 			case 71: // 'G' pong
 				break
+			case 84: // 'T' settings ack - sync local state + reconfigure the pipeline.
+				handleSettingsAck(buf.subarray(1))
+				break
 			default:
 				break
 		}
@@ -1290,7 +1762,7 @@ function inputDiag(type) {
 	if (now - lastInputDiag < 1000) return
 	lastInputDiag = now
 	const state = ws ? wsStateName[ws.readyState] + "(" + ws.readyState + ")" : "null"
-	console.log("[input] " + type + " (ws=" + state + ")")
+	console.debug&&console.debug("[input] " + type + " (ws=" + state + ")")
 }
 
 function sendInput(type, x, y, key, delta, button) {
@@ -1299,6 +1771,434 @@ function sendInput(type, x, y, key, delta, button) {
 	const msg = { type, x, y, key, delta, button }
 	const buf = new TextEncoder().encode(JSON.stringify(msg))
 	ws.send(new Uint8Array([73 /* 'I' */, ...buf]))
+}
+
+// --- Pointer-lock "capture input" mode (Phase 1) ---
+//
+// By default the client forwards ABSOLUTE pointer positions (normalized [0,1]
+// within the visible video element), which the server maps to an absolute
+// screen position. Capture mode (opt-in) switches to RELATIVE movement: the
+// pointer is locked to the video element (requestPointerLock), the local
+// cursor is hidden, and pointer motion is forwarded as pointer-lock deltas
+// (movementX/movementY) that the server scales and emits as REL_X/REL_Y. This
+// feels like a normal mouse (the remote cursor moves 1:1 with the local
+// pointer, without the local cursor being clamped to the video element's
+// edges) and is the natural mode for interactive use (games, drawing, etc.).
+//
+// Toggle: Ctrl+Shift+L (intercepted BEFORE the key is forwarded to the host,
+// so the toggle key never reaches the remote machine). While locked, the
+// browser's native Escape releases the pointer lock (unpreventable); that
+// Escape is swallowed (not forwarded) so the host does not receive a stray
+// Escape keypress from the "release capture" gesture. Re-locking requires a
+// fresh Ctrl+Shift+L (the browser enforces a ~1.25s cooldown after an Escape
+// release, so an immediate re-lock is rejected by the browser - by design).
+let captureMode = false
+let captureEl = null
+// --- Settings (quality/fps/scale/monitor) ---
+// The client-side view of the capture parameters. The server is the source of
+// truth: it acks each kindSettings message with the effective values
+// (kindSettingsAck), which the client syncs here. The bar buttons cycle the
+// local value and send it; the ack confirms (or corrects) it.
+const settings = {
+	quality: "med", // "low" (3200/7200), "med" (5000/15000), "high" (7200/21000)
+	fps: 60, // 15/24/30/45/60
+	scale: 1.0, // 0.5-1.0
+	monitor: "" // xrandr output name; "" = primary
+}
+const QUALITY_CYCLE = ["low", "med", "high"]
+const FPS_CYCLE = [15, 24, 30, 45, 60]
+const SCALE_CYCLE = [1.0, 0.75, 0.5]
+// monitors is the /monitors list (cached); the display button cycles through
+// it ("" = primary first).
+let monitors = [""]
+let monitorIdx = 0
+
+// sendSettings sends a kindSettings ('S') message over the control channel.
+// The payload is a partial settingsMsg: only the provided fields are applied
+// (the server merges over the current parameters), so a single knob can be
+// changed without resending the whole configuration.
+function sendSettings(obj) {
+	if (!ws || ws.readyState !== WebSocket.OPEN) return
+	const buf = new TextEncoder().encode(JSON.stringify(obj))
+	ws.send(new Uint8Array([83 /* 'S' */, ...buf]))
+}
+
+// handleSettingsAck processes a kindSettingsAck ('T') message: the server's
+// confirmation of an applied settings change, carrying the effective values.
+// The client syncs its local settings state to the acked values and
+// reconfigures the video pipeline if the encoder changed (a new SPS/PPS or a
+// fresh moov is required to decode the reconfigured stream):
+//   raw  - the raw socket stays open across the capture restart (the
+//          broadcaster persists), so only the decoder is reset: the next
+//          SPS/PPS-carrying access unit reconfigures it (rawConfigured=false).
+//   fmp4 - the SourceBuffer's codec (avcC) is fixed at creation, so the whole
+//          pipeline is rebuilt on a fresh MediaSource (reconnectStream).
+function handleSettingsAck(payload) {
+	let s
+	try {
+		s = JSON.parse(new TextDecoder().decode(payload))
+	} catch (e) {
+		return
+	}
+	if (s.fps) settings.fps = s.fps
+	if (s.scale) settings.scale = s.scale
+	if (s.monitor !== undefined) settings.monitor = s.monitor
+	if (mode === "raw") {
+		// Reset the decoder so the next SPS/PPS reconfigures it. The raw socket
+		// stays open (the broadcaster persists across the capture restart).
+		rawConfigured = false
+		rawConfigFailures = 0
+		rawInFlight = 0
+		try {
+			if (decoder) decoder.close()
+		} catch (e) {
+			// already closed; ignore.
+		}
+		decoder = null
+		rawFrameIndex = 0
+		dbgFrames.length = 0
+		dbgPendingArrivals.length = 0
+		prevBlit = 0
+	} else if (mode === "fmp4") {
+		// Rebuild the fMP4 pipeline on a fresh MediaSource (the new capture
+		// emits a fresh moov that the SourceBuffer must be created from).
+		reconnectStream(document.getElementById("video"))
+	}
+}
+
+// --- Splash screen ---
+// splashDone is set once the splash has faded out. hideSplash() is idempotent:
+// it is called from the first raw blit (the first decoded frame is visible)
+// and from the first fMP4 stream byte (the "Click to start" overlay becomes
+// visible; the user click is what starts playback per the autoplay policy),
+// and only the first call does anything.
+let splashDone = false
+function hideSplash() {
+	if (splashDone) return
+	splashDone = true
+	const s = document.getElementById("splash")
+	if (!s) return
+	s.classList.add("hidden")
+	// Remove from the DOM after the fade-out transition so it stops intercepting
+	// pointer events (the .hidden class sets opacity:0; the element would
+	// otherwise still cover the stage).
+	setTimeout(() => {
+		s.style.display = "none"
+	}, 700)
+}
+
+// --- Performance overlay ---
+// The performance overlay (bottom-left) shows the current FPS and bandwidth
+// (kbps) with a 30-second sparkline for each. Both are measured client-side:
+//   raw  - frames = blitLatest() count, bytes = /raw onmessage length.
+//   fmp4 - frames = <video> requestVideoFrameCallback count, bytes = the
+//          /stream read-loop chunk length.
+// A 1-second sampler (perfTimer) aggregates the counters into per-second
+// samples (fpsHist/bwHist, 30 samples = 30s) and redraws the sparklines.
+const PERF_SAMPLES = 30 // 30 samples x 1s = 30s window
+let perfTimer = null
+let perfOn = false
+let perfFrames = 0 // frames since the last sample (raw: blits, fmp4: rVFC)
+let perfBytes = 0 // bytes since the last sample
+let fpsHist = [] // per-second FPS samples (oldest first)
+let bwHist = [] // per-second kbps samples (oldest first)
+let perfFpsEl = null
+let perfBwEl = null
+let perfFpsCanvas = null
+let perfBwCanvas = null
+let perfFpsCtx = null
+let perfBwCtx = null
+
+// perfSample runs once per second: fold the counters into a sample, push it
+// (capped at PERF_SAMPLES), and redraw both sparklines.
+function perfSample() {
+	const fps = perfFrames
+	const kbps = perfBytes * 8 / 1000
+	perfFrames = 0
+	perfBytes = 0
+	fpsHist.push(fps)
+	bwHist.push(kbps)
+	if (fpsHist.length > PERF_SAMPLES) fpsHist.shift()
+	if (bwHist.length > PERF_SAMPLES) bwHist.shift()
+	if (perfFpsEl) perfFpsEl.textContent = String(fps)
+	if (perfBwEl) perfBwEl.textContent = kbps.toFixed(0)
+	drawSparkline(perfFpsCtx, fpsHist, "#3fb950")
+	drawSparkline(perfBwCtx, bwHist, "#58a6ff")
+}
+
+// drawSparkline paints a 30-sample sparkline (one column per second) on a
+// 120x24 canvas: a filled area under a line, scaled to the window's max.
+// A flat zero window draws a single baseline dot so the overlay reads as
+// "no data" rather than an empty box.
+function drawSparkline(ctx, hist, color) {
+	const w = ctx.canvas.width
+	const h = ctx.canvas.height
+	ctx.clearRect(0, 0, w, h)
+	if (!hist.length) return
+	let max = 1
+	for (const v of hist) if (v > max) max = v
+	const n = hist.length
+	const step = w / PERF_SAMPLES
+	ctx.beginPath()
+	for (let i = 0; i < n; i++) {
+		const x = (PERF_SAMPLES - n + i) * step
+		const y = h - 2 - (hist[i] / max) * (h - 4)
+		if (i === 0) ctx.moveTo(x + step / 2, y)
+		else ctx.lineTo(x + step / 2, y)
+	}
+	ctx.strokeStyle = color
+	ctx.lineWidth = 1.5
+	ctx.stroke()
+	// Fill under the line.
+	ctx.lineTo((PERF_SAMPLES - 1) * step + step / 2, h - 1)
+	ctx.lineTo((PERF_SAMPLES - n) * step + step / 2, h - 1)
+	ctx.closePath()
+	ctx.globalAlpha = 0.25
+	ctx.fillStyle = color
+	ctx.fill()
+	ctx.globalAlpha = 1
+}
+
+// rVFC loop handle for fMP4-mode frame counting (requestVideoFrameCallback is
+// only available on the <video> element; the raw path counts blits instead).
+let rVFCActive = false
+function rVFCLoop() {
+	if (!rVFCActive) return
+	perfFrames++
+	const video = document.getElementById("video")
+	if (video && typeof video.requestVideoFrameCallback === "function") {
+		video.requestVideoFrameCallback(() => rVFCLoop())
+	}
+}
+
+// wirePerfOverlay starts/stops the 1-second performance sampler and shows/hides
+// the overlay. It is toggled from the settings bar's performance button. In
+// raw mode frames are counted in blitLatest(); in fMP4 mode a
+// requestVideoFrameCallback loop counts <video> presentation frames.
+function wirePerfOverlay() {
+	const el = document.getElementById("perf")
+	perfFpsEl = document.getElementById("perf-fps-val")
+	perfBwEl = document.getElementById("perf-bw-val")
+	perfFpsCanvas = document.getElementById("perf-fps-graph")
+	perfBwCanvas = document.getElementById("perf-bw-graph")
+	perfFpsCtx = perfFpsCanvas.getContext("2d")
+	perfBwCtx = perfBwCanvas.getContext("2d")
+	const btn = document.getElementById("btn-perf")
+	btn.addEventListener("click", () => {
+		if (perfOn) {
+			perfOn = false
+			el.classList.add("hidden")
+			btn.classList.remove("active")
+			clearInterval(perfTimer)
+			perfTimer = null
+			rVFCActive = false
+		} else {
+			perfOn = true
+			el.classList.remove("hidden")
+			btn.classList.add("active")
+			perfTimer = setInterval(perfSample, 1000)
+			if (mode === "fmp4") {
+				rVFCActive = true
+				rVFCLoop()
+			}
+		}
+	})
+}
+
+// wireSettingsBar wires the bottom-right settings bar: capture (pointer-lock
+// toggle), quality/fps/scale (cycle + send), display (cycle /monitors), audio
+// (disabled until Phase 4), fullscreen, and performance overlay. Each
+// quality/fps/scale/display click updates the local settings state, updates
+// the button's label, and sends a kindSettings message; the server's ack
+// (handleSettingsAck) confirms the effective values.
+function wireSettingsBar() {
+	const label = document.getElementById("bar-label")
+	const showLabel = (text) => {
+		label.textContent = text
+		label.classList.add("show")
+		clearTimeout(showLabel.t)
+		showLabel.t = setTimeout(() => label.classList.remove("show"), 1500)
+	}
+	// Capture: toggle pointer-lock capture mode (reuses the Ctrl+Shift+L path).
+	const btnCapture = document.getElementById("btn-capture")
+	btnCapture.addEventListener("click", () => {
+		if (captureMode) exitCaptureMode()
+		else enterCaptureMode()
+	})
+	document.addEventListener("pointerlockchange", () => {
+		btnCapture.classList.toggle("active", captureMode)
+	})
+	// Quality: cycle low -> med -> high and send the preset.
+	const btnQuality = document.getElementById("btn-quality")
+	btnQuality.addEventListener("click", () => {
+		const i = QUALITY_CYCLE.indexOf(settings.quality)
+		settings.quality = QUALITY_CYCLE[(i + 1) % QUALITY_CYCLE.length]
+		showLabel("quality: " + settings.quality)
+		sendSettings({ quality: settings.quality })
+	})
+	// FPS: cycle 15 -> 24 -> 30 -> 45 -> 60 and send.
+	const btnFps = document.getElementById("btn-fps")
+	btnFps.addEventListener("click", () => {
+		const i = FPS_CYCLE.indexOf(settings.fps)
+		settings.fps = FPS_CYCLE[(i + 1) % FPS_CYCLE.length]
+		showLabel("fps: " + settings.fps)
+		sendSettings({ fps: settings.fps })
+	})
+	// Scale: cycle 1.0 -> 0.75 -> 0.5 and send.
+	const btnScale = document.getElementById("btn-scale")
+	btnScale.addEventListener("click", () => {
+		const i = SCALE_CYCLE.indexOf(settings.scale)
+		settings.scale = SCALE_CYCLE[(i + 1) % SCALE_CYCLE.length]
+		showLabel("scale: " + settings.scale.toFixed(2))
+		sendSettings({ scale: settings.scale })
+	})
+	// Display: cycle the /monitors list ("" = primary first) and send the
+	// xrandr output name. The list is fetched once (cached); a failure leaves
+	// the list as [""] (primary only).
+	const btnDisplay = document.getElementById("btn-display")
+	const updateDisplayLabel = () => {
+		const name = monitors[monitorIdx]
+		showLabel(name ? "display: " + name : "display: primary")
+	}
+	fetchMonitors()
+	btnDisplay.addEventListener("click", () => {
+		if (monitors.length < 2) return // only primary; nothing to cycle.
+		monitorIdx = (monitorIdx + 1) % monitors.length
+		settings.monitor = monitors[monitorIdx]
+		updateDisplayLabel()
+		sendSettings({ monitor: settings.monitor })
+	})
+	// Audio: toggle the /audio relay (opus over WS -> WebCodecs AudioDecoder
+	// -> AudioContext). The AudioContext is created inside the click handler
+	// (a user gesture) so autoplay policy is satisfied.
+	const btnAudio = document.getElementById("btn-audio")
+	if (btnAudio) {
+		btnAudio.addEventListener("click", () => {
+			toggleAudio().then(() => {
+				showLabel(audioEnabled ? "audio: on" : "audio: off")
+			})
+		})
+	}
+	// Fullscreen: toggle the active video element's fullscreen.
+	const btnFull = document.getElementById("btn-fullscreen")
+	btnFull.addEventListener("click", () => {
+		const el = activeVideoEl()
+		if (!el) return
+		if (document.fullscreenElement) {
+			try {
+				document.exitFullscreen()
+			} catch (e) {
+				// ignore
+			}
+		} else if (typeof el.requestFullscreen === "function") {
+			el.requestFullscreen().catch((e) => console.warn("fullscreen:", e))
+		}
+	})
+	document.addEventListener("fullscreenchange", () => {
+		btnFull.classList.toggle("active", !!document.fullscreenElement)
+	})
+	// Performance overlay: toggle the 1-second FPS/bandwidth sampler.
+	wirePerfOverlay()
+}
+
+// fetchMonitors fetches the /monitors list (xrandr outputs) and caches it for
+// the display-cycling button. A failure (xrandr unavailable, auth) leaves the
+// list as [""] (primary only) so the button is a harmless no-op.
+async function fetchMonitors() {
+	try {
+		const token = await getToken()
+		const params = new URLSearchParams()
+		if (token) params.set("token", token)
+		const res = await fetch(`/monitors${params.toString() ? `?${params.toString()}` : ""}`)
+		if (!res.ok) return
+		const list = await res.json()
+		if (Array.isArray(list) && list.length > 0) {
+			monitors = ["", ...list.map((m) => m.name)]
+			// Clamp the index into the new list.
+			if (monitorIdx >= monitors.length) monitorIdx = 0
+		}
+	} catch (e) {
+		// xrandr unavailable or network error; primary-only.
+	}
+}
+
+// escapeSwallowUntil suppresses forwarding an Escape keypress to the host for
+// this many ms after the pointer lock is released (so the "release capture"
+// Escape does not also press Escape on the remote machine).
+let escapeSwallowUntil = 0
+
+// activeVideoEl returns the element currently showing the remote desktop: the
+// <canvas> in raw mode, the <video> in fMP4 mode. Pointer lock is requested
+// on this element (the one the user is looking at).
+function activeVideoEl() {
+	return document.getElementById("stage")
+	// using "stage" as the fullscreen element, beaucse it allows
+	// us to keep the control and status bar's present
+	// return mode === "raw"
+	// 	? document.getElementById("canvas")
+	// 	: document.getElementById("video")
+}
+
+// enterCaptureMode requests pointer lock on the active video element. A
+// pointer-lock request MUST originate from a user gesture (browser security
+// policy), so this is called from the Ctrl+Shift+L keydown handler (a gesture).
+// The lock actually engages asynchronously (pointerlockchange fires); the
+// capture-mode state is set from that event, not here, so a rejected request
+// (e.g. the ~1.25s post-Escape cooldown) does not leave captureMode stuck on.
+function enterCaptureMode() {
+	const el = activeVideoEl()
+	if (!el || typeof el.requestPointerLock !== "function") return
+	try {
+		// requestPointerLock may return a Promise (Chrome) that rejects on a
+		// cooldown/permission failure; swallow it (the pointerlockchange/
+		// pointerlockerror events are the source of truth).
+		const r = el.requestPointerLock()
+		if (r && typeof r.catch === "function") r.catch((e) => console.warn("capture: pointer lock request rejected:", e))
+	} catch (e) {
+		console.warn("capture: requestPointerLock threw:", e)
+	}
+}
+
+// exitCaptureMode releases the pointer lock (the browser fires
+// pointerlockchange, which clears captureMode).
+function exitCaptureMode() {
+	if (document.pointerLockElement) {
+		try {
+			document.exitPointerLock()
+		} catch (e) {
+			// already unlocked; ignore.
+		}
+	}
+}
+
+// wirePointerLock binds the pointer-lock state to captureMode. The browser
+// fires pointerlockchange whenever the lock engages or releases (including a
+// native Escape release, which we cannot prevent). We mirror that state into
+// captureMode so the mousemove handler knows whether to send relative or
+// absolute events.
+function wirePointerLock() {
+	document.addEventListener("pointerlockchange", () => {
+		const locked = document.pointerLockElement !== null
+		captureMode = locked
+		captureEl = locked ? document.pointerLockElement : null
+		// Reflect the capture state in the status bar so the user knows when
+		// the pointer is locked (cursor hidden, relative movement active).
+		const hint = document.getElementById("hint")
+		if (hint) hint.textContent = locked ? "Screen Relay — capture mode (Ctrl+Shift+L to release)" : "Screen Relay"
+		if (!locked) {
+			// The lock just released. If it was released by a native Escape
+			// (the common case), swallow the Escape that caused it so the host
+			// does not receive a stray Escape keypress. We cannot distinguish
+			// an Escape release from an exitPointerLock() release here, so we
+			// always swallow the next Escape for a short window; a deliberate
+			// host Escape within that ~600ms window is an acceptable trade-off
+			// (the user is in the middle of a capture-mode transition).
+			escapeSwallowUntil = Date.now() + 600
+		}
+	})
+	document.addEventListener("pointerlockerror", (e) => {
+		console.warn("capture: pointer lock error:", e)
+	})
 }
 
 // normXY converts a client pointer position to normalized [0,1] coordinates
@@ -1321,12 +2221,44 @@ function normXY(e) {
 // KeyboardEvent.code (e.g. "KeyA", "Enter", "ShiftLeft") so the server can
 // map them to Linux EV_KEY codes; wheel is sent as a normalized scroll notch.
 window.addEventListener("keydown", (e) => {
+	// Ctrl+Shift+L toggles pointer-lock "capture input" mode. Intercepted
+	// BEFORE the key is forwarded to the host, so the toggle combination never
+	// reaches the remote machine (the host never sees a Ctrl+Shift+L press).
+	if (e.ctrlKey && e.shiftKey && e.code === "KeyL") {
+		e.preventDefault()
+		e.stopPropagation()
+		if (captureMode) exitCaptureMode()
+		else enterCaptureMode()
+		return
+	}
+	// While releasing capture mode via a native Escape, swallow the Escape so
+	// the host does not receive a stray Escape keypress from the "release
+	// capture" gesture. The swallow window is set by the pointerlockchange
+	// handler when the lock releases.
+	if (e.code === "Escape" && Date.now() < escapeSwallowUntil) {
+		e.preventDefault()
+		e.stopPropagation()
+		return
+	}
 	sendInput("keydown", 0, 0, e.code)
 	// Prevent browser shortcuts (Ctrl+Tab, etc.) from firing while the remote
 	// session is active.
 	if (e.code !== "F5" && e.code !== "F12" && !(e.ctrlKey && e.shiftKey)) e.preventDefault()
 })
 window.addEventListener("keyup", (e) => {
+	// Mirror the keydown interception: do not forward the release of the
+	// Ctrl+Shift+L toggle combo (the host never saw the press) or the release
+	// of a swallowed Escape (the host never saw the press).
+	if (e.ctrlKey && e.shiftKey && e.code === "KeyL") {
+		e.preventDefault()
+		e.stopPropagation()
+		return
+	}
+	if (e.code === "Escape" && Date.now() < escapeSwallowUntil) {
+		e.preventDefault()
+		e.stopPropagation()
+		return
+	}
 	sendInput("keyup", 0, 0, e.code)
 	if (e.code !== "F5" && e.code !== "F12" && !(e.ctrlKey && e.shiftKey)) e.preventDefault()
 })
@@ -1339,19 +2271,42 @@ window.addEventListener("mouseup", (e) => {
 	sendInput("mouseup", x, y, "", 0, e.button)
 })
 window.addEventListener("mousemove", (e) => {
+	if (captureMode) {
+		// Pointer-lock mode: forward the pointer-lock deltas (movementX/Y,
+		// CSS pixels) as a relative movement. The server scales them by its
+		// relSensitivity and emits REL_X/REL_Y. movementX/Y are only
+		// meaningful while the pointer is locked (the browser zeroes them
+		// otherwise), so this path is only reached when captureMode is set.
+		sendInput("relmousemove", e.movementX, e.movementY)
+		return
+	}
 	const [x, y] = normXY(e)
 	sendInput("mousemove", x, y)
 })
-window.addEventListener("wheel", (e) => {
-	// Normalize the wheel delta to a scroll "notch" (deltaMode 0 = pixels,
-	// ~100px per notch; deltaMode 1 = lines, ~3 per notch). The server
-	// forwards it as a REL_WHEEL event.
-	const notch = e.deltaMode === 1 ? Math.round(e.deltaY / 3) : Math.round(e.deltaY / 100)
-	if (notch !== 0) {
-		sendInput("wheel", 0, 0, "", notch)
-		e.preventDefault()
-	}
-}, { passive: false })
+// wireWheel binds the scroll handler to the STAGE element (the video/canvas
+// container), not `window`. The previous window-scoped handler forwarded ANY
+// page scroll (e.g. the user scrolling the local page while the cursor was
+// over the status bar or a margin) to the host as a REL_WHEEL event - the
+// "wheel triggering on host" symptom. Scoping to the stage means only scrolls
+// over the remote desktop surface reach the host. In pointer-lock (capture)
+// mode the locked element is the stage's child, so wheel events still bubble
+// to the stage handler and the remote page scrolls as expected.
+//
+// The delta is normalized to a scroll "notch" (deltaMode 0 = pixels, ~100px
+// per notch; deltaMode 1 = lines, ~3 per notch) so the host receives a
+// consistent magnitude regardless of the client's wheel granularity. The
+// server amplifies each notch by wheelUnitsPerNotch (env-tunable) REL_WHEEL
+// units.
+function wireWheel() {
+	const stage = document.getElementById("stage")
+	stage.addEventListener("wheel", (e) => {
+		const notch = e.deltaMode === 1 ? Math.round(e.deltaY / 3) : Math.round(e.deltaY / 100)
+		if (notch !== 0) {
+			sendInput("wheel", 0, 0, "", -notch)
+			e.preventDefault()
+		}
+	}, { passive: false })
+}
 
 // selectMode picks the video path: ?mode=fmp4 forces the fMP4/MSE fallback;
 // otherwise the raw WebCodecs path is the default when VideoDecoder is
@@ -1386,5 +2341,9 @@ function selectMode() {
 	}
 	wireStartOverlay()
 	wireDebugCopy()
+	wirePointerLock()
+	wireWheel()
+	wireSettingsBar()
 	await openSocket()
 })()
+ 

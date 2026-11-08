@@ -27,6 +27,27 @@ the control channel.
 | `SCREENRELAY_CLIENT_DIR` | `client` | directory with `index.html` + `app.js` |
 | `SCREENRELAY_BEARER` | *(empty)* | shared bearer token for the WS handshake. **Empty = auth disabled** (the server logs a warning). |
 | `SCREENRELAY_DISABLE_CAPTURE` | *(unset)* | when set, skip the capture pipeline (Mutter/PipeWire/GStreamer) and serve the control channel only — useful for testing without the heavy capture path. |
+| `SCREENRELAY_REL_SENSITIVITY` | `1.0` | multiplier applied to the client's pointer-lock deltas (capture mode) before they are emitted as `REL_X`/`REL_Y` events. `1.0` is a 1:1 CSS-pixel-to-screen-pixel mapping; raise it for high-DPI hosts where the remote cursor should move faster than the local pointer. |
+| `SCREENRELAY_WHEEL_UNITS_PER_NOTCH` | `3` | `REL_WHEEL` magnitude emitted per client scroll notch. A single unit scrolls a very small amount in GNOME, so the default amplifies each notch 3× for a visible step; tune to taste. |
+| `SCREENRELAY_DISABLE_AUDIO` | *(unset)* | when set, never start the audio pipeline (pulsesrc/opusenc GStreamer). The `/audio` WS still connects but stays silent. |
+| `SCREENRELAY_AUDIO_SOURCE` | `@DEFAULT_MONITOR@` | the `pulsesrc` monitor device to tap. The default is `@DEFAULT_MONITOR@` (the default sink's monitor = the system audio the user hears). A specific sink can be named (e.g. `default` or a sink name from `pactl list short sinks`) to tap only that sink's output. **Do not set this to a plain source (microphone)** — a bare `pulsesrc` with no device property captures the default *source*, which is silent when the mic is unused and makes opus emit ~2–4 byte silence packets. |
+| `SCREENRELAY_AUDIO_DUMP` | *(unset)* | when set to a path (e.g. `audio_dump.ogg`), dump the raw Ogg stream to that file for inspection (`ffmpeg -i audio_dump.ogg`, `ogginfo audio_dump.ogg`). |
+
+## Security / trust model
+
+The relay is a LAN / SSH-tunnel tool. The single bearer token
+(`SCREENRELAY_BEARER`) is the only gate; if it is unset the relay is open.
+
+**`/health` returns the bearer token in its JSON response by design.** The
+browser client cannot set arbitrary HTTP headers, so it bootstraps the token
+from `/health` and then passes it as a `?token=` query parameter on `/raw`,
+`/stream`, and `/relay`. This means anyone who can reach `/health` can reach
+the full relay — so the trust model is: **the relay is only reachable over a
+trusted channel** (localhost, a private LAN, or an SSH tunnel). Returning the
+token does not widen the attack surface beyond "can reach the port".
+
+If the relay must be reachable from an untrusted network, put it behind an SSH
+tunnel or a VPN; do not rely on the bearer token alone.
 
 ## Input relay (uinput) — permission setup
 
@@ -96,6 +117,31 @@ released first, so no key stays stuck on the remote machine).
 - **Keyboard**: full `EV_KEY` set; the browser sends `KeyboardEvent.code`
   (e.g. `KeyA`, `Enter`, `ShiftLeft`) and the server maps it to the Linux
   `EV_KEY` code (`input_keys.go`).
+
+### Capture mode (pointer lock)
+
+By default the client forwards **absolute** pointer positions (normalized [0,1]
+within the visible video element), which the server maps to an absolute screen
+position. **Capture mode** (opt-in) switches to **relative** movement: the
+pointer is locked to the video element, the local cursor is hidden, and pointer
+motion is forwarded as pointer-lock deltas (`movementX`/`movementY`) that the
+server scales and emits as `REL_X`/`REL_Y` events. This feels like a normal
+mouse (the remote cursor moves 1:1 with the local pointer, without the local
+cursor being clamped to the video element's edges) and is the natural mode for
+interactive use (games, drawing, etc.).
+
+- **Toggle**: `Ctrl+Shift+L` (intercepted before the key is forwarded to the
+  host, so the toggle combination never reaches the remote machine).
+- **Release**: `Escape` (the browser's native pointer-lock release). The
+  `Escape` that releases the lock is swallowed so the host does not receive a
+  stray `Escape` keypress. Re-locking requires a fresh `Ctrl+Shift+L` (the
+  browser enforces a ~1.25s cooldown after an `Escape` release).
+- **Sensitivity**: `SCREENRELAY_REL_SENSITIVITY` (default `1.0`) scales the
+  pointer-lock deltas before they are emitted as `REL_X`/`REL_Y` events.
+
+The virtual device registers both `ABS_X`/`ABS_Y` and `REL_X`/`REL_Y` axes on
+the same node, so the client can switch between absolute (unlocked) and
+relative (locked) movement without recreating the device.
 
 ## Build
 

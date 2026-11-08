@@ -1,11 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -23,7 +23,41 @@ const (
 	kindPing messageKind = 'P'
 	// kindPong is a keepalive reply.
 	kindPong messageKind = 'G'
+	// kindSettings is a capture/encode configuration change from browser ->
+	// server (quality/fps/scale/monitor). The server validates the payload,
+	// applies it to rs.curParams and restarts the capture pipeline with the
+	// new values, then replies with kindSettingsAck.
+	kindSettings messageKind = 'S'
+	// kindSettingsAck is the server's acknowledgement of a kindSettings
+	// message (applied successfully). The payload is the settingsMsg JSON
+	// that was applied, so the client can confirm the effective values.
+	kindSettingsAck messageKind = 'T'
 )
+
+// settingsMsg is the JSON payload of a kindSettings ('S') message: the
+// capture/encode configuration the client wants to apply. Any field left at
+// its zero value is left unchanged (the server merges the provided fields
+// over rs.curParams), so the client can change a single knob without
+// resending the whole configuration.
+type settingsMsg struct {
+	// Quality is a named preset: "low" (3200/7200 kbps), "med"
+	// (5000/15000 kbps), "high" (7200/21000 kbps). When set, it overrides
+	// Bitrate/Maxrate (which are otherwise applied directly if non-empty).
+	Quality string `json:"quality"`
+	// Bitrate is the target VBR bitrate in kbps (e.g. "5500").
+	Bitrate string `json:"bitrate"`
+	// Maxrate is the peak bitrate in kbps (e.g. "14400").
+	Maxrate string `json:"maxrate"`
+	// FPS is the clean output framerate (15/24/30/45/60).
+	FPS int `json:"fps"`
+	// Scale is the output scale factor (0.5-1.0); 1.0 = full resolution.
+	Scale float64 `json:"scale"`
+	// Monitor is the xrandr output name to capture ("" = primary). It is a
+	// pointer so an explicit "" (switch back to the primary monitor) is
+	// distinguishable from "not provided" (nil = leave the current monitor
+	// unchanged), which a plain string cannot express (both are "").
+	Monitor *string `json:"monitor"`
+}
 
 // subscriber is a /stream client's receive channel plus its lag state. lag
 // counts consecutive chunks that could not be delivered because the channel
@@ -169,6 +203,100 @@ func (s *RawStreamServer) write(au []byte) {
 	s.mu.Unlock()
 }
 
+// AudioStreamServer fans out the live audio (opus packets, one per Ogg page
+// packet) to connected /audio WebSocket clients. It mirrors RawStreamServer's
+// fan-out + lag-drop policy: each client gets its own buffered channel, and a
+// client whose channel stays full for dropLag packets is dropped (channel
+// closed) so a persistently slow client cannot wedge the audio pump.
+// audioHeadMagic prefixes the OpusHead re-emit message so a client can
+// distinguish it from a bare opus audio packet on the same binary channel.
+const audioHeadMagic = "AUDIOHEAD:"
+
+type AudioStreamServer struct {
+	mu      sync.Mutex
+	clients map[chan []byte]*subscriber
+	dropped int64 // total subscribers dropped for persistent lag (diagnostics)
+	// head is the last OpusHead packet seen from the pipeline (the stream's
+	// channel count + sample rate). Cached so a client that connects after the
+	// pipeline already started still receives it (like the fMP4 init segment):
+	// without it the client cannot configure its AudioDecoder to match the
+	// ACTUAL stream and decodes fail with a DataError.
+	head []byte
+}
+
+// newAudioStreamServer creates an empty audio broadcaster.
+func newAudioStreamServer() *AudioStreamServer {
+	return &AudioStreamServer{clients: make(map[chan []byte]*subscriber)}
+}
+
+// setHead stores the OpusHead packet and re-emits it to every current
+// subscriber (non-blocking; a slow subscriber simply misses it and will get
+// the next one). Called once by the audio pump when the demuxer first sees
+// the OpusHead.
+func (s *AudioStreamServer) setHead(head []byte) {
+	msg := append([]byte(audioHeadMagic), head...)
+	s.mu.Lock()
+	s.head = head
+	for _, sub := range s.clients {
+		select {
+		case sub.ch <- msg:
+		default: // subscriber is back-pressured; skip (it will get live packets).
+		}
+	}
+	s.mu.Unlock()
+}
+
+// add registers a new audio subscriber and returns its receive channel. If a
+// head has already been captured (the pipeline started before this client
+// connected), the head is re-emitted to the new subscriber first so it can
+// configure its decoder before any audio packets arrive. The caller MUST pass
+// the returned channel to remove when done.
+func (s *AudioStreamServer) add() chan []byte {
+	ch := make(chan []byte, subscriberChannelSize)
+	s.mu.Lock()
+	s.clients[ch] = &subscriber{ch: ch}
+	if s.head != nil {
+		msg := append([]byte(audioHeadMagic), s.head...)
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+	s.mu.Unlock()
+	return ch
+}
+
+// remove unregisters an audio subscriber previously obtained via add.
+func (s *AudioStreamServer) remove(ch chan []byte) {
+	s.mu.Lock()
+	delete(s.clients, ch)
+	s.mu.Unlock()
+}
+
+// write broadcasts a single opus packet to every audio subscriber. Back-
+// pressured subscribers are skipped for that packet; their lag counter
+// increments. A subscriber whose lag reaches dropLag is dropped (channel
+// closed + removed) so a persistently slow client cannot wedge the pump.
+// The pump never blocks on a client: every send is non-blocking.
+func (s *AudioStreamServer) write(pkt []byte) {
+	s.mu.Lock()
+	for ch, sub := range s.clients {
+		select {
+		case sub.ch <- pkt:
+			sub.lag = 0
+		default:
+			sub.lag++
+			if sub.lag >= dropLag {
+				delete(s.clients, ch)
+				close(sub.ch) // ServeAudio loop sees the close and returns.
+				s.dropped++
+				log.Printf("audio: dropped slow subscriber (lag %d packets)", sub.lag)
+			}
+		}
+	}
+	s.mu.Unlock()
+}
+
 // RelayServer multiplexes the WebSocket control channel (ping/pong + key/mouse
 // input) between the connected browser and the remote capture/encode pipeline.
 // The live video is served two ways:
@@ -187,10 +315,17 @@ type RelayServer struct {
 	// raw fans out the live raw H.264 access units (primary path) to
 	// connected /raw WebSocket clients.
 	raw *RawStreamServer
+	// audio fans out the live audio (opus packets) to connected /audio
+	// WebSocket clients.
+	audio *AudioStreamServer
 	// capture owns the Mutter ScreenCast session + GStreamer pipeline
 	// (capture, NVENC, raw H.264 + Go fMP4 re-mux). Set by ensureCapture;
 	// torn down in Close / client disconnect. nil until capture has started.
 	capture *Capture
+	// audioCap owns the audio GStreamer pipeline (pulsesrc monitor -> opusenc
+	// -> oggmux -> fdsink). Set by ensureAudio; torn down in Close / last
+	// /audio client disconnect. nil until the audio pipeline has started.
+	audioCap *AudioCapture
 	// captureMu guards the rs.capture lifecycle and the connect->start /
 	// disconnect->teardown transition so capture starts on the first video
 	// client connect (raw WS or fMP4 HTTP) and tears down on the last
@@ -202,6 +337,10 @@ type RelayServer struct {
 	// rawCount is the number of active /raw WebSocket (WebCodecs) video
 	// clients.
 	rawCount int64
+	// audioCount is the number of active /audio WebSocket (opus) audio
+	// clients. It drives the audio pipeline's lifecycle: start on the first
+	// connect, tear down on the last disconnect.
+	audioCount int64
 	// inputCh receives key/mouse events from the connected browser; drained
 	// into the uinput virtual device by the inputLoop goroutine.
 	inputCh chan []byte
@@ -211,6 +350,21 @@ type RelayServer struct {
 	input *uinputInjector
 	// authEnabled reports whether a bearer token is required.
 	authEnabled bool
+	// initMu guards initSeg: the fMP4 init segment (ftyp+moov) is built once
+	// by the capture's muxer and stored here so a /stream client that joins
+	// after the init was first broadcast can be re-served it (MSE cannot start
+	// without the moov). Written by storeInitSegment (the muxer's emitInit
+	// callback, on the pump goroutine), read by ServeStream when a
+	// late-joining subscriber registers.
+	initMu  sync.Mutex
+	initSeg []byte
+	// curParams is the current capture/encode configuration (bitrate, maxrate,
+	// fps, scale, monitor). It is the source of truth for ensureCapture: the
+	// initial value comes from the environment (defaultCaptureParams) and the
+	// settings channel (kindSettings, 'S') updates it at runtime, restarting
+	// the capture pipeline with the new values. Guarded by captureMu (the
+	// same lock that guards the rs.capture lifecycle).
+	curParams captureParams
 }
 
 // NewRelayServer builds the relay server and its upgrader.
@@ -220,6 +374,7 @@ func NewRelayServer(cfg config) *RelayServer {
 		authEnabled: cfg.Bearer != "",
 		stream:      newStreamServer(),
 		raw:         newRawStreamServer(),
+		audio:       newAudioStreamServer(),
 	}
 	// AllowOrigin is intentionally permissive for MVP: the transport is
 	// protected by the bearer handshake (and/or SSH tunnel).
@@ -232,6 +387,10 @@ rs.upgrader = websocket.Upgrader{
 	}
 	rs.inputCh = make(chan []byte, 64)
 	rs.input = newUinputInjector()
+	// The initial capture parameters come from the environment (see
+	// defaultCaptureParams); the settings channel (kindSettings, 'S') updates
+	// them at runtime.
+	rs.curParams = defaultCaptureParams()
 	go rs.inputLoop()
 	return rs
 }
@@ -240,19 +399,8 @@ rs.upgrader = websocket.Upgrader{
 // virtual device. It runs for the relay's lifetime; the device is created
 // lazily on the first event (so a video-only relay never touches /dev/uinput)
 // and destroyed in Close.
-//
-// A throttled diagnostic logs the first event of each type (and once per
-// second thereafter) so you can confirm events are arriving and being
-// dispatched. Remove once input is confirmed working end-to-end.
 func (rs *RelayServer) inputLoop() {
-	var lastLog int64
 	for raw := range rs.inputCh {
-		// Throttled: log once per second (mousemove spam otherwise floods).
-		now := time.Now().UnixMilli()
-		if now-lastLog > 1000 {
-			lastLog = now
-			log.Printf("input: received %s", string(raw))
-		}
 		rs.input.dispatchInput(raw)
 	}
 }
@@ -266,9 +414,34 @@ func (rs *RelayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rs.ServeStream(w, r)
 	case "/raw":
 		rs.ServeRaw(w, r)
+	case "/audio":
+		rs.ServeAudio(w, r)
+	case "/monitors":
+		rs.ServeMonitors(w, r)
 	default:
 		rs.ServeWS(w, r)
 	}
+}
+
+// ServeMonitors lists the connected xrandr outputs (name, resolution,
+// position, refresh rate, primary flag) as JSON. The client uses this to
+// populate its display-switching control (the settings channel then captures
+// the chosen monitor by name). It is read-only and does not start capture.
+func (rs *RelayServer) ServeMonitors(w http.ResponseWriter, r *http.Request) {
+	if rs.authEnabled {
+		token := r.URL.Query().Get("token")
+		if token != rs.cfg.Bearer {
+			http.Error(w, "invalid bearer token", http.StatusUnauthorized)
+			return
+		}
+	}
+	mons := listMonitors()
+	if mons == nil {
+		mons = []monitorInfo{} // marshal as [] rather than null
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	_ = json.NewEncoder(w).Encode(mons)
 }
 
 // ServeRaw upgrades the HTTP connection to a WebSocket and serves the live
@@ -331,6 +504,66 @@ func (rs *RelayServer) ServeRaw(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ServeAudio upgrades the HTTP connection to a WebSocket and serves the live
+// audio stream: one binary message per opus packet (extracted from the Ogg
+// page framing by the audio pump). The client decodes each packet with
+// WebCodecs (AudioDecoder, codec "opus") and plays it through an
+// AudioContext.
+//
+// The audio pipeline lifecycle is driven by the /audio client count: a
+// client connecting when no audio pipeline is running starts it (the audio
+// pump owns the ogg-demuxed packet stream), and the pipeline tears down when
+// the last client disconnects.
+func (rs *RelayServer) ServeAudio(w http.ResponseWriter, r *http.Request) {
+	// The browser WebSocket API cannot set arbitrary headers (Authorization),
+	// so the bearer token is passed as a query parameter: /audio?token=...
+	if rs.authEnabled {
+		token := r.URL.Query().Get("token")
+		if token != rs.cfg.Bearer {
+			http.Error(w, "invalid bearer token", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	conn, err := rs.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	// Drive the audio pipeline lifecycle from the audio-client count. Start
+	// the pipeline on the first connect; tear it down on the last disconnect.
+	atomic.AddInt64(&rs.audioCount, 1)
+	defer func() {
+		atomic.AddInt64(&rs.audioCount, -1)
+		rs.stopAudio()
+	}()
+	rs.ensureAudio()
+
+	// Register as a subscriber to the audio packet stream.
+	ch := rs.audio.add()
+	defer rs.audio.remove(ch)
+
+	// Write pump: one binary WS message per opus packet. A slow client's
+	// channel fills and the lag-drop policy drops it (the channel is closed
+	// and the loop below returns), so the pump never blocks on a client.
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case pkt, ok := <-ch:
+			if !ok {
+				// Channel closed: the subscriber was dropped (persistent lag)
+				// or the broadcaster shut down.
+				return
+			}
+			if werr := conn.WriteMessage(websocket.BinaryMessage, pkt); werr != nil {
+				return
+			}
+		}
+	}
+}
+
 // ServeWS upgrades the HTTP connection to a WebSocket and runs the relay loop
 // until the client disconnects or the server is closed. It is the control
 // channel only: ping/pong keepalive and key/mouse input forwarding. The live
@@ -373,6 +606,23 @@ func (rs *RelayServer) ServeWS(w http.ResponseWriter, r *http.Request) {
 			case rs.inputCh <- cp:
 			default:
 				// Backpressure: drop if the input pipeline isn't draining.
+			}
+		case kindSettings:
+			// Parse the settings payload, validate it, apply it to curParams
+			// and restart the capture pipeline with the new values. Reply
+			// with a kindSettingsAck carrying the effective values so the
+			// client can confirm what was applied.
+			var s settingsMsg
+			if err := json.Unmarshal(data[1:], &s); err != nil {
+				log.Printf("settings: invalid payload: %v", err)
+				continue
+			}
+			applied := rs.applySettings(s)
+			if ack, err := json.Marshal(applied); err == nil {
+				ackMsg := make([]byte, 0, 1+len(ack))
+				ackMsg = append(ackMsg, byte(kindSettingsAck))
+				ackMsg = append(ackMsg, ack...)
+				_ = conn.WriteMessage(websocket.TextMessage, ackMsg)
 			}
 		}
 		_ = msgType
@@ -425,6 +675,20 @@ func (rs *RelayServer) ServeStream(w http.ResponseWriter, r *http.Request) {
 	// Register as a subscriber to the live stream.
 	ch := rs.stream.add()
 	defer rs.stream.remove(ch)
+
+	// Re-emit the fMP4 init segment (ftyp+moov) to this subscriber if one has
+	// already been built. A /stream client that joins after the init was first
+	// broadcast never sees it (it was written to the old subscribers' channels),
+	// and MSE cannot start without the moov, so we write it here before any
+	// live fragment. If no init segment has been built yet (the capture is
+	// still starting up), the init will arrive via the channel when the muxer
+	// builds it, so there is nothing to write.
+	if initSeg := rs.initSegment(); initSeg != nil {
+		if _, werr := w.Write(initSeg); werr != nil {
+			return
+		}
+		flusher.Flush()
+	}
 
 	for {
 		select {
@@ -485,7 +749,7 @@ func (rs *RelayServer) ensureCapture() {
 	if rs.capture != nil || rs.videoClientCount() == 0 {
 		return
 	}
-	cap := newCapture()
+	cap := newCapture(rs.curParams)
 	if cap == nil {
 		return
 	}
@@ -522,12 +786,211 @@ func (rs *RelayServer) stopCapture() {
 	log.Printf("capture: torn down (0 connected video client(s))")
 }
 
-// Close shuts down the relay and terminates the capture pipeline.
+// audioClientCount returns the number of active /audio WebSocket clients.
+func (rs *RelayServer) audioClientCount() int64 {
+	return atomic.LoadInt64(&rs.audioCount)
+}
+
+// ensureAudio starts the audio pipeline when the first /audio client
+// connects and it isn't already running. It holds captureMu for the whole
+// check-and-start so the audio pipeline starts exactly once regardless of how
+// many clients connect. The audio pipeline is a separate GStreamer process
+// (pulsesrc monitor -> opusenc -> oggmux -> fdsink) that fans its ogg-demuxed
+// opus packets out to rs.audio.
+func (rs *RelayServer) ensureAudio() {
+	// SCREENRELAY_DISABLE_AUDIO: never start the audio pipeline.
+	if rs.cfg.DisableAudio {
+		return
+	}
+	rs.captureMu.Lock()
+	defer rs.captureMu.Unlock()
+	if rs.audioCap != nil || rs.audioClientCount() == 0 {
+		return
+	}
+	cap := newAudioCapture()
+	if cap == nil {
+		return
+	}
+	rs.audioCap = cap
+	go func() {
+		ok := cap.run(rs)
+		// run() has returned: the pipeline is dead (failure or teardown).
+		// Drop the audio capture ref only if it still points at this capture
+		// so a later connect can retry; a newer capture already running wins.
+		rs.captureMu.Lock()
+		if !ok && rs.audioCap == cap {
+			rs.audioCap = nil
+		}
+		rs.captureMu.Unlock()
+	}()
+	log.Printf("audio: starting (%d connected audio client(s))", rs.audioClientCount())
+}
+
+// stopAudio tears down the audio pipeline when the last /audio client
+// disconnects. It holds captureMu so it can't race the ensureAudio
+// transition.
+func (rs *RelayServer) stopAudio() {
+	rs.captureMu.Lock()
+	defer rs.captureMu.Unlock()
+	if rs.audioCap == nil || rs.audioClientCount() > 0 {
+		return
+	}
+	rs.audioCap.teardown()
+	rs.audioCap = nil
+	log.Printf("audio: torn down (0 connected audio client(s))")
+}
+
+// qualityPresets maps a named quality preset to its target/peak bitrate
+// (kbps). The client cycles through these via the settings channel; a
+// custom bitrate/maxrate (non-empty) overrides the preset.
+var qualityPresets = map[string][2]string{
+	"low":  {"3200", "7200"},
+	"med":  {"5000", "15000"},
+	"high": {"7200", "21000"},
+}
+
+// validFPS is the set of clean output framerates the encoder supports
+// (videorate resample target + gop-size).
+var validFPS = map[int]bool{15: true, 24: true, 30: true, 45: true, 60: true}
+
+// applySettings validates and merges a settingsMsg over rs.curParams (zero
+// fields are left unchanged), updates rs.curParams, and restarts the capture
+// pipeline with the new values if one is running. It holds captureMu for the
+// whole check-and-restart so the capture lifecycle (ensureCapture /
+// stopCapture) can't race the transition. It returns the effective
+// parameters that were applied, for the client's confirmation.
+//
+// The restart is a teardown + ensureCapture: the old pipeline is stopped
+// (signalling the process group + the D-Bus session) and a new one is started
+// with the new parameters. The fMP4 init segment is re-built and
+// re-broadcast (storeInitSegment) so connected /stream clients pick up the
+// new codec configuration; /raw clients re-sync on the next SPS/PPS.
+func (rs *RelayServer) applySettings(s settingsMsg) captureParams {
+	rs.captureMu.Lock()
+	defer rs.captureMu.Unlock()
+
+	p := rs.curParams
+
+	// Merge the provided fields over the current parameters. Zero values are
+	// left unchanged so the client can change a single knob.
+	if s.Bitrate != "" {
+		p.Bitrate = s.Bitrate
+	}
+	if s.Maxrate != "" {
+		p.Maxrate = s.Maxrate
+	}
+	if s.FPS > 0 {
+		p.FPS = s.FPS
+	}
+	if s.Scale > 0 {
+		p.Scale = s.Scale
+	}
+	// Monitor is a pointer so an explicit "" (switch back to the primary
+	// monitor) is distinguishable from "not provided" (nil = leave the current
+	// monitor unchanged). A plain string could not express this (both are "").
+	if s.Monitor != nil {
+		p.MonitorID = *s.Monitor
+	}
+	// A named quality preset overrides the explicit bitrate/maxrate (the
+	// client sends the preset it selected, not the raw values).
+	if s.Quality != "" {
+		if pr, ok := qualityPresets[s.Quality]; ok {
+			p.Bitrate = pr[0]
+			p.Maxrate = pr[1]
+		}
+	}
+
+	// Validate the framerate (the encoder's gop-size + videorate target).
+	if !validFPS[p.FPS] {
+		p.FPS = defaultOutFPS
+	}
+	// Clamp the scale to a sane range (0.5 = half resolution, 1.0 = full).
+	if p.Scale < 0.5 {
+		p.Scale = 0.5
+	}
+	if p.Scale > 1.0 {
+		p.Scale = 1.0
+	}
+
+	rs.curParams = p
+	log.Printf("settings: applied (quality=%q bitrate=%s maxrate=%s fps=%d scale=%.2f monitor=%q)",
+		s.Quality, p.Bitrate, p.Maxrate, p.FPS, p.Scale, p.MonitorID)
+
+	// Restart the capture pipeline with the new values if one is running.
+	// If no capture is running (no video clients), the new parameters take
+	// effect when the next client connects (ensureCapture).
+	if rs.capture != nil {
+		old := rs.capture
+		old.teardown()
+		rs.capture = nil
+		if rs.videoClientCount() > 0 {
+			cap := newCapture(rs.curParams)
+			if cap == nil {
+				return p
+			}
+			rs.capture = cap
+			go func() {
+				ok := cap.run(rs)
+				// run() has returned: the pipeline is dead (failure or
+				// teardown). Drop the capture ref only if it still points at
+				// this capture so a newer capture or a concurrent teardown
+				// wins.
+				rs.captureMu.Lock()
+				if !ok && rs.capture == cap {
+					rs.capture = nil
+				}
+				rs.captureMu.Unlock()
+			}()
+			log.Printf("settings: capture restarted with new parameters")
+		}
+	}
+	return p
+}
+
+// storeInitSegment stores the fMP4 init segment (ftyp+moov) so a /stream
+// client that joins after the init was first built can be re-served it, and
+// broadcasts it to the subscribers that are currently connected. It is called
+// by the capture's muxer (emitInit) the first time the init segment is built
+// (on the pump goroutine). The broadcast is required because the muxer's
+// feed() routes the init through emitInit (not emit) when emitInit is set, so
+// current subscribers would otherwise never see it on their channels. The
+// stored copy is taken before the broadcast so a concurrent teardown of a
+// subscriber cannot race the write.
+func (rs *RelayServer) storeInitSegment(initSeg []byte) {
+	rs.initMu.Lock()
+	rs.initSeg = append([]byte{}, initSeg...)
+	rs.initMu.Unlock()
+	// Broadcast to the subscribers connected at this moment; a subscriber
+	// that registers after this point gets the init via ServeStream (which
+	// writes rs.initSegment() before its first live fragment).
+	rs.stream.write(initSeg)
+}
+
+// initSegment returns a copy of the last fMP4 init segment (ftyp+moov) stored,
+// or nil if none yet (the capture is still starting up; the init will arrive
+// via the subscriber channel when the muxer builds it). ServeStream writes it
+// to a newly added subscriber so a late joiner can start MSE playback: the
+// init was broadcast to the subscribers that were connected when it was built,
+// so a subscriber added after that moment would otherwise miss it.
+func (rs *RelayServer) initSegment() []byte {
+	rs.initMu.Lock()
+	defer rs.initMu.Unlock()
+	if rs.initSeg == nil {
+		return nil
+	}
+	return append([]byte{}, rs.initSeg...)
+}
+
+// Close shuts down the relay and terminates the capture and audio pipelines.
 func (rs *RelayServer) Close() {
 	rs.captureMu.Lock()
 	if rs.capture != nil {
 		rs.capture.teardown()
 		rs.capture = nil
+	}
+	if rs.audioCap != nil {
+		rs.audioCap.teardown()
+		rs.audioCap = nil
 	}
 	rs.captureMu.Unlock()
 	// Destroy the uinput virtual device (no-op if it was never created).

@@ -27,7 +27,7 @@
 - fix the mouse wheel triggering on host
 
 #### When captured:
-- hide the client mouse cursor
+- hide the client mouse cursor (OR hide the host cursor? / detect the current cursor and send to the client for rendering locally?)
 - use the mouse capture API to lock the mouse to center window
 - run relative mouse input on the host
 - long press "escape" to uncapture the mouse

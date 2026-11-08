@@ -38,6 +38,15 @@ import (
 type fmp4Muxer struct {
 	outFPS int    // clean output framerate (CFR)
 	emit   func([]byte) // box-group sink (rs.stream.write)
+	// emitInit is called with the init segment (ftyp+moov) the first time it is
+	// built. The relay wires it to (a) store the segment for late-joining
+	// /stream subscribers (a client that connects after the init has already
+	// been built never sees it, and MSE cannot start without the moov) and
+	// (b) broadcast it to the subscribers connected at that moment. When set,
+	// feed routes the init through emitInit ONLY (not emit), so the callback
+	// MUST broadcast to current subscribers or they miss the init. nil = init
+	// is broadcast via emit only (late joiners miss it).
+	emitInit func([]byte)
 
 	mu sync.Mutex // guards Close racing feed on teardown
 
@@ -55,13 +64,23 @@ type fmp4Muxer struct {
 	// frameCount is the number of access units seen so far; the next sample's
 	// DTS is frameCount * frameDur (track units).
 	frameCount uint32
+
+	// seq is the per-fragment sequence number (mfhd), monotonically increasing
+	// per the fMP4 spec (wraps at 2^32). It is a dedicated fragment counter,
+	// NOT the track time: the spec requires sequence numbers to increase by 1
+	// per fragment, so a decoder can order fragments and detect gaps.
+	seq uint32
 }
 
 // newFmp4Muxer creates a muxer for an outFPS-framerate stream; emit receives
 // each complete box group (init segment or moof+mdat fragment) as it is
-// produced.
-func newFmp4Muxer(outFPS int, emit func([]byte)) *fmp4Muxer {
-	return &fmp4Muxer{outFPS: outFPS, emit: emit}
+// produced. emitInit (optional) receives the init segment the first time it is
+// built, so the relay can store it for late-joining subscribers; if nil the
+// init segment is broadcast via emit only.
+func newFmp4Muxer(outFPS int, emit func([]byte), emitInit func([]byte)) *fmp4Muxer {
+	// seq starts at 1 so the first fragment carries sequence_number 1 (the
+	// fMP4 convention is a 1-based monotonic counter; 0 is reserved).
+	return &fmp4Muxer{outFPS: outFPS, emit: emit, emitInit: emitInit, seq: 1}
 }
 
 // frameDur returns the per-sample duration in track units (timescale
@@ -144,7 +163,18 @@ func (m *fmp4Muxer) feed(au []byte) {
 		if m.width == 0 {
 			m.width, m.height = 1920, 1080
 		}
-		m.emit(m.buildInitSegment())
+		initSeg := m.buildInitSegment()
+		if m.emitInit != nil {
+			// The relay's storeInitSegment (a) stores the segment for
+			// late-joining /stream subscribers and (b) broadcasts it to the
+			// subscribers connected at this moment. Current subscribers only
+			// receive the init through this path (feed does NOT also call
+			// emit), so the broadcast in storeInitSegment is required, not
+			// redundant.
+			m.emitInit(initSeg)
+		} else {
+			m.emit(initSeg)
+		}
 		m.initEmitted = true
 		log.Printf("fmp4mux: init segment emitted (track %dx%d, codec %s)",
 			m.width, m.height, m.codecString())
@@ -192,6 +222,8 @@ func (m *fmp4Muxer) emitFragment() {
 	frag.Write(hdr[:])
 	frag.Write(m.pending)
 	m.emit(frag.Bytes())
+	// Advance the per-fragment sequence number (mfhd) for the next fragment.
+	m.seq++
 	// Reset the pending fragment.
 	m.fragSamples = 0
 	m.fragIDR = false
@@ -243,6 +275,10 @@ func (m *fmp4Muxer) buildInitSegment() []byte {
 	out.Write(ftyp)
 
 	var moov bytes.Buffer
+	// The moov box header (size patched at the end); the box contains
+	// mvhd + trak + mvex. MSE requires a proper moov wrapper around the
+	// track headers (a bare mvhd/trak/mvex sequence is not a valid MP4).
+	writeBoxHeader(&moov, "moov", 0)
 	// mvhd (version 0): 108 bytes total.
 	{
 		var b bytes.Buffer
@@ -459,23 +495,28 @@ func (m *fmp4Muxer) buildMoof() []byte {
 	trunSize := 20 + 12*n
 	// tfhd box total: header (8) + version/flags (4) + track_ID (4) = 16.
 	// tfdt box total: header (8) + version/flags (4) + base_time (4) = 16.
+	// mfhd box total: header (8) + version/flags (4) + sequence_number (4) = 16.
 	// traf size: header (8) + tfhd (16) + tfdt (16) + trun.
 	trafSize := 8 + 16 + 16 + trunSize
-	// moof size: header (8) + mfhd (12) + traf.
-	moofSize := 8 + 12 + trafSize
+	// moof size: header (8) + mfhd (16) + traf.
+	moofSize := 8 + 16 + trafSize
 	// data-offset: relative to the start of the trun box. The trun box
-	// starts at offset 60 within the moof (moof header 8 + mfhd 12 + traf
+	// starts at offset 64 within the moof (moof header 8 + mfhd 16 + traf
 	// header 8 + tfhd 16 + tfdt 16); the mdat payload starts at
 	// moofSize + 8 (after the moof and the 8-byte mdat header).
-	dataOffset := uint32(moofSize + 8 - 60)
+	dataOffset := uint32(moofSize + 8 - 64)
 
 	var moof bytes.Buffer
 	writeBoxHeader(&moof, "moof", moofSize-8)
-	// mfhd: sequence_number (monotonic fragment counter; wraps are fine).
+	// mfhd (version 0): version/flags word (0) then sequence_number
+	// (monotonic fragment counter; wraps are fine). Per the fMP4 spec this is
+	// a per-fragment counter (m.seq), NOT the track time: it must increase by
+	// 1 per fragment so a decoder can order fragments and detect gaps.
 	{
 		var b bytes.Buffer
-		writeBoxHeader(&b, "mfhd", 4)
-		b.Write(u32(m.fragStart>>0)) // sequence_number (track-time derived)
+		writeBoxHeader(&b, "mfhd", 8)
+		b.Write([]byte{0, 0, 0, 0}) // version 0, flags 0
+		b.Write(u32(m.seq))         // sequence_number (per-fragment counter)
 		moof.Write(b.Bytes())
 	}
 	var traf bytes.Buffer
@@ -506,7 +547,7 @@ func (m *fmp4Muxer) buildMoof() []byte {
 	{
 		var b bytes.Buffer
 		writeBoxHeader(&b, "trun", trunSize-8)
-		b.Write([]byte{0, 0, 0x0F}) // version 0, flags 0x00F
+		b.Write([]byte{0, 0, 0x00, 0x0F}) // version 0, flags 0x00F
 		b.Write(u32(uint32(n)))    // sample_count
 		b.Write(u32(dataOffset))    // data_offset
 		for i := 0; i < n; i++ {
