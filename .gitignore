@@ -30,7 +30,7 @@ go.work.sum
 
 # Build artifacts
 bin/
-/screenrelay
+/coaxial
 
 # Agent session state
 .cadence/

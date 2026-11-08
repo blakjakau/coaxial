@@ -1,4 +1,4 @@
-# screenrelay
+# coaxial
 
 Remote-side server that captures the screen, encodes it (NVENC, GStreamer), and
 serves the live stream to a browser client. It also relays the browser's
@@ -23,20 +23,25 @@ the control channel.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SCREENRELAY_ADDR` | `:8080` | listen address |
-| `SCREENRELAY_CLIENT_DIR` | `client` | directory with `index.html` + `app.js` |
-| `SCREENRELAY_BEARER` | *(empty)* | shared bearer token for the WS handshake. **Empty = auth disabled** (the server logs a warning). |
-| `SCREENRELAY_DISABLE_CAPTURE` | *(unset)* | when set, skip the capture pipeline (Mutter/PipeWire/GStreamer) and serve the control channel only — useful for testing without the heavy capture path. |
-| `SCREENRELAY_REL_SENSITIVITY` | `1.0` | multiplier applied to the client's pointer-lock deltas (capture mode) before they are emitted as `REL_X`/`REL_Y` events. `1.0` is a 1:1 CSS-pixel-to-screen-pixel mapping; raise it for high-DPI hosts where the remote cursor should move faster than the local pointer. |
-| `SCREENRELAY_WHEEL_UNITS_PER_NOTCH` | `3` | `REL_WHEEL` magnitude emitted per client scroll notch. A single unit scrolls a very small amount in GNOME, so the default amplifies each notch 3× for a visible step; tune to taste. |
-| `SCREENRELAY_DISABLE_AUDIO` | *(unset)* | when set, never start the audio pipeline (pulsesrc/opusenc GStreamer). The `/audio` WS still connects but stays silent. |
-| `SCREENRELAY_AUDIO_SOURCE` | `@DEFAULT_MONITOR@` | the `pulsesrc` monitor device to tap. The default is `@DEFAULT_MONITOR@` (the default sink's monitor = the system audio the user hears). A specific sink can be named (e.g. `default` or a sink name from `pactl list short sinks`) to tap only that sink's output. **Do not set this to a plain source (microphone)** — a bare `pulsesrc` with no device property captures the default *source*, which is silent when the mic is unused and makes opus emit ~2–4 byte silence packets. |
-| `SCREENRELAY_AUDIO_DUMP` | *(unset)* | when set to a path (e.g. `audio_dump.ogg`), dump the raw Ogg stream to that file for inspection (`ffmpeg -i audio_dump.ogg`, `ogginfo audio_dump.ogg`). |
+| `COAXIAL_ADDR` | `:8080` | listen address |
+| `COAXIAL_CLIENT_DIR` | `client` | directory with `index.html` + `app.js` |
+| `COAXIAL_BEARER` | *(empty)* | shared bearer token for the WS handshake. **Empty = auth disabled** (the server logs a warning). |
+| `COAXIAL_DISABLE_CAPTURE` | *(unset)* | when set, skip the capture pipeline (Mutter/PipeWire/GStreamer) and serve the control channel only — useful for testing without the heavy capture path. |
+| `COAXIAL_WIDTH` / `COAXIAL_HEIGHT` | monitor resolution | initial capture resolution (clamped to the display's maximum). The client's settings channel can change these at runtime. |
+| `COAXIAL_FPS` | `60` | clean output framerate (the stream is resampled to this via `videorate`). |
+| `COAXIAL_BITRATE` | `5500` | target VBR bitrate in kbps for `nvh264enc`. |
+| `COAXIAL_MAXRATE` | `14400` | peak bitrate in kbps for `nvh264enc`. |
+| `COAXIAL_CUDA_DEVICE` | *(auto)* | pin the NVENC encoder to a specific CUDA device index. By default the most-freed NVIDIA device is selected via `nvidia-smi` (a busy high-VRAM GPU often runs out of memory during init). |
+| `COAXIAL_REL_SENSITIVITY` | `1.0` | multiplier applied to the client's pointer-lock deltas (capture mode) before they are emitted as `REL_X`/`REL_Y` events. `1.0` is a 1:1 CSS-pixel-to-screen-pixel mapping; raise it for high-DPI hosts where the remote cursor should move faster than the local pointer. |
+| `COAXIAL_WHEEL_UNITS_PER_NOTCH` | `3` | `REL_WHEEL` magnitude emitted per client scroll notch. A single unit scrolls a very small amount in GNOME, so the default amplifies each notch 3× for a visible step; tune to taste. |
+| `COAXIAL_DISABLE_AUDIO` | *(unset)* | when set, never start the audio pipeline (pulsesrc/opusenc GStreamer). The `/audio` WS still connects but stays silent. |
+| `COAXIAL_AUDIO_SOURCE` | `@DEFAULT_MONITOR@` | the `pulsesrc` monitor device to tap. The default is `@DEFAULT_MONITOR@` (the default sink's monitor = the system audio the user hears). A specific sink can be named (e.g. `default` or a sink name from `pactl list short sinks`) to tap only that sink's output. **Do not set this to a plain source (microphone)** — a bare `pulsesrc` with no device property captures the default *source*, which is silent when the mic is unused and makes opus emit ~2–4 byte silence packets. |
+| `COAXIAL_AUDIO_DUMP` | *(unset)* | when set to a path (e.g. `audio_dump.ogg`), dump the raw Ogg stream to that file for inspection (`ffmpeg -i audio_dump.ogg`, `ogginfo audio_dump.ogg`). |
 
 ## Security / trust model
 
 The relay is a LAN / SSH-tunnel tool. The single bearer token
-(`SCREENRELAY_BEARER`) is the only gate; if it is unset the relay is open.
+(`COAXIAL_BEARER`) is the only gate; if it is unset the relay is open.
 
 **`/health` returns the bearer token in its JSON response by design.** The
 browser client cannot set arbitrary HTTP headers, so it bootstraps the token
@@ -69,7 +74,7 @@ user. You need **one** of:
 **Option A — run the relay as root** (simplest for a trusted machine):
 
 ```sh
-sudo ./screenrelay
+sudo ./coaxial
 ```
 
 **Option B — grant the logged-in seat access via a udev rule** (recommended):
@@ -136,7 +141,7 @@ interactive use (games, drawing, etc.).
   `Escape` that releases the lock is swallowed so the host does not receive a
   stray `Escape` keypress. Re-locking requires a fresh `Ctrl+Shift+L` (the
   browser enforces a ~1.25s cooldown after an `Escape` release).
-- **Sensitivity**: `SCREENRELAY_REL_SENSITIVITY` (default `1.0`) scales the
+- **Sensitivity**: `COAXIAL_REL_SENSITIVITY` (default `1.0`) scales the
   pointer-lock deltas before they are emitted as `REL_X`/`REL_Y` events.
 
 The virtual device registers both `ABS_X`/`ABS_Y` and `REL_X`/`REL_Y` axes on
@@ -146,8 +151,8 @@ relative (locked) movement without recreating the device.
 ## Build
 
 ```sh
-go build -o bin/screenrelay .
+go build -o bin/coaxial .
 ```
 
 The browser client is static (`client/index.html` + `client/app.js`); the
-server serves it from `SCREENRELAY_CLIENT_DIR`.
+server serves it from `COAXIAL_CLIENT_DIR`.

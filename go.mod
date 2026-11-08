@@ -1,4 +1,4 @@
-module screenrelay
+module coaxial
 
 go 1.26.8
 

@@ -52,8 +52,8 @@ const (
 )
 
 // captureParams is the tunable capture/encode configuration. The initial
-// values come from the environment (SCREENRELAY_BITRATE / SCREENRELAY_MAXRATE
-// / SCREENRELAY_FPS, see defaultCaptureParams); the client can change them at
+// values come from the environment (COAXIAL_BITRATE / COAXIAL_MAXRATE
+// / COAXIAL_FPS, see defaultCaptureParams); the client can change them at
 // runtime via the settings channel (kindSettings, 'S'), which restarts the
 // capture pipeline with the new values. Resolution is NOT stored here: it is
 // derived from the selected monitor (MonitorID) at capture start, clamped to
@@ -76,13 +76,13 @@ func defaultCaptureParams() captureParams {
 		FPS:     defaultOutFPS,
 		Scale:   1.0,
 	}
-	if v := os.Getenv("SCREENRELAY_BITRATE"); v != "" {
+	if v := os.Getenv("COAXIAL_BITRATE"); v != "" {
 		p.Bitrate = v
 	}
-	if v := os.Getenv("SCREENRELAY_MAXRATE"); v != "" {
+	if v := os.Getenv("COAXIAL_MAXRATE"); v != "" {
 		p.Maxrate = v
 	}
-	if v := os.Getenv("SCREENRELAY_FPS"); v != "" {
+	if v := os.Getenv("COAXIAL_FPS"); v != "" {
 		fmt.Sscanf(v, "%d", &p.FPS)
 	}
 	return p
@@ -213,8 +213,8 @@ type Capture struct {
 	height int // capture height
 	outFPS int // clean output framerate (60); videorate resample target + gop-size
 
-	// Encoder rate-control parameters (overridable via SCREENRELAY_BITRATE,
-	// SCREENRELAY_MAXRATE). nvh264enc uses a VBR target (bitrate, in kbps)
+	// Encoder rate-control parameters (overridable via COAXIAL_BITRATE,
+	// COAXIAL_MAXRATE). nvh264enc uses a VBR target (bitrate, in kbps)
 	// with an optional peak (maxrate) for motion bursts.
 	bitrate string // target VBR bitrate in kbps, e.g. "8000"
 	maxrate string // peak bitrate in kbps allowed for motion bursts
@@ -363,7 +363,7 @@ func virtualScreen() (vw, vh, ox, oy, pw, ph int, ok bool) {
 // the selected monitor's (p.MonitorID, "" = primary) clamped to the maximum
 // stream constraints (maxWidth/maxHeight/maxFPS) and scaled by p.Scale (the
 // pipeline's cudascale stage does the actual downscale). The
-// SCREENRELAY_WIDTH/HEIGHT/FPS/BITRATE/MAXRATE environment variables are
+// COAXIAL_WIDTH/HEIGHT/FPS/BITRATE/MAXRATE environment variables are
 // applied as overrides on top of the params (env wins), so the initial
 // capture (from defaultCaptureParams) can still be tuned without a client.
 // A monitor that cannot be found falls back to the primary, and to the
@@ -415,19 +415,19 @@ func newCapture(p captureParams) *Capture {
 
 	// Environment overrides (the initial capture can be tuned without a
 	// client; the client's settings channel wins for runtime changes).
-	if v := os.Getenv("SCREENRELAY_WIDTH"); v != "" {
+	if v := os.Getenv("COAXIAL_WIDTH"); v != "" {
 		fmt.Sscanf(v, "%d", &c.width)
 	}
-	if v := os.Getenv("SCREENRELAY_HEIGHT"); v != "" {
+	if v := os.Getenv("COAXIAL_HEIGHT"); v != "" {
 		fmt.Sscanf(v, "%d", &c.height)
 	}
-	if v := os.Getenv("SCREENRELAY_FPS"); v != "" {
+	if v := os.Getenv("COAXIAL_FPS"); v != "" {
 		fmt.Sscanf(v, "%d", &c.outFPS)
 	}
-	if v := os.Getenv("SCREENRELAY_BITRATE"); v != "" {
+	if v := os.Getenv("COAXIAL_BITRATE"); v != "" {
 		c.bitrate = v
 	}
-	if v := os.Getenv("SCREENRELAY_MAXRATE"); v != "" {
+	if v := os.Getenv("COAXIAL_MAXRATE"); v != "" {
 		c.maxrate = v
 	}
 
@@ -991,7 +991,7 @@ func startCodeLen(buf []byte) int {
 func selectEncoderGPU() string {
 	// Allow an explicit override so tests/other boxes need not depend on the
 	// nvidia-smi CLI.
-	if v := os.Getenv("SCREENRELAY_CUDA_DEVICE"); v != "" {
+	if v := os.Getenv("COAXIAL_CUDA_DEVICE"); v != "" {
 		return v
 	}
 

@@ -35,7 +35,7 @@ import (
 // out to the /audio WebSocket subscribers (rs.audio).
 //
 // The monitor source taps the output of a sink (the system audio the user
-// hears). The default (SCREENRELAY_AUDIO_SOURCE unset) is
+// hears). The default (COAXIAL_AUDIO_SOURCE unset) is
 // "@DEFAULT_MONITOR@" - PulseAudio's special name for the default sink's
 // monitor, i.e. the system audio the user hears. This is critical: a bare
 // pulsesrc with NO device property captures the default SOURCE (the
@@ -56,18 +56,18 @@ type AudioCapture struct {
 }
 
 // newAudioCapture builds an AudioCapture from the environment. The
-// SCREENRELAY_AUDIO_SOURCE env var names the pulsesrc monitor device to tap.
+// COAXIAL_AUDIO_SOURCE env var names the pulsesrc monitor device to tap.
 // Unset, it defaults to "@DEFAULT_MONITOR@" (the default sink's monitor =
 // the system audio the user hears). A bare pulsesrc with no device property
 // would instead capture the default SOURCE (the microphone), which is wrong
 // for a screen relay: a silent mic makes opus emit ~2-4 byte silence
 // packets, which is exactly the "tiny packet" symptom this default avoids.
 func newAudioCapture() *AudioCapture {
-	src := os.Getenv("SCREENRELAY_AUDIO_SOURCE")
+	src := os.Getenv("COAXIAL_AUDIO_SOURCE")
 	if src == "" {
 		src = "@DEFAULT_MONITOR@"
 	}
-	log.Printf("audio: monitor source %q (SCREENRELAY_AUDIO_SOURCE)", src)
+	log.Printf("audio: monitor source %q (COAXIAL_AUDIO_SOURCE)", src)
 	return &AudioCapture{src: src}
 }
 
@@ -123,11 +123,11 @@ func (c *AudioCapture) run(rs *RelayServer) bool {
 	log.Printf("audio: gst-launch (pid %d, pgid %d) started", gstCmd.Process.Pid, c.pgid)
 
 	// Optional: dump the raw Ogg stream to a file for inspection (gated by
-	// SCREENRELAY_AUDIO_DUMP, e.g. "audio_dump.ogg"). This lets you run
+	// COAXIAL_AUDIO_DUMP, e.g. "audio_dump.ogg"). This lets you run
 	// `ffmpeg -i audio_dump.ogg -f s16le out.pcm` or `ogginfo audio_dump.ogg`
 	// to see exactly what the pipeline is producing.
 	var dumpW io.WriteCloser
-	if dumpPath := os.Getenv("SCREENRELAY_AUDIO_DUMP"); dumpPath != "" {
+	if dumpPath := os.Getenv("COAXIAL_AUDIO_DUMP"); dumpPath != "" {
 		f, err := os.Create(dumpPath)
 		if err != nil {
 			log.Printf("audio: failed to open dump file %q: %v", dumpPath, err)

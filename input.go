@@ -66,14 +66,14 @@ const initRetryInterval = 5000
 // client movement = one REL_X/REL_Y unit on the host). The host's REL axis
 // unit is screen pixels, so a value > 1.0 makes the remote cursor move faster
 // than the local pointer (useful when the host screen is higher-DPI than the
-// client). Tunable via SCREENRELAY_REL_SENSITIVITY (default 1.0).
+// client). Tunable via COAXIAL_REL_SENSITIVITY (default 1.0).
 var relSensitivity = parseRelSensitivity()
 
-// parseRelSensitivity reads SCREENRELAY_REL_SENSITIVITY (a float), defaulting
+// parseRelSensitivity reads COAXIAL_REL_SENSITIVITY (a float), defaulting
 // to 1.0. A non-numeric or non-positive value falls back to 1.0 (a zero or
 // negative sensitivity would make the relative cursor inert or invert it).
 func parseRelSensitivity() float64 {
-	v := os.Getenv("SCREENRELAY_REL_SENSITIVITY")
+	v := os.Getenv("COAXIAL_REL_SENSITIVITY")
 	if v == "" {
 		return 1.0
 	}
@@ -678,16 +678,16 @@ func (i *uinputInjector) button(code uint16, pressed bool) {
 // wheelUnitsPerNotch is the REL_WHEEL magnitude emitted per client scroll
 // notch. A single REL_WHEEL unit scrolls by a very small amount in GNOME, so
 // one unit per notch feels nearly inert. Emitting several units per notch
-// gives a normal-feeling scroll step. Tunable via SCREENRELAY_WHEEL_UNITS_PER_NOTCH
+// gives a normal-feeling scroll step. Tunable via COAXIAL_WHEEL_UNITS_PER_NOTCH
 // (default 3) so the scroll "feel" can be tuned to the host's compositor
 // without a rebuild.
 var wheelUnitsPerNotch = parseWheelUnitsPerNotch()
 
-// parseWheelUnitsPerNotch reads SCREENRELAY_WHEEL_UNITS_PER_NOTCH (a positive
+// parseWheelUnitsPerNotch reads COAXIAL_WHEEL_UNITS_PER_NOTCH (a positive
 // int), defaulting to 3. A zero or negative value falls back to 3 (zero
 // amplification would make the wheel inert; negative would invert it).
 func parseWheelUnitsPerNotch() int32 {
-	v := os.Getenv("SCREENRELAY_WHEEL_UNITS_PER_NOTCH")
+	v := os.Getenv("COAXIAL_WHEEL_UNITS_PER_NOTCH")
 	if v == "" {
 		return 1
 	}

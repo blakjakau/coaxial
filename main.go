@@ -1,4 +1,4 @@
-// Command screenrelay is a remote-side server that captures the screen,
+// Command coaxial is a remote-side server that captures the screen,
 // encodes it to H.264 via NVENC (GStreamer nvh264enc), and serves the live
 // stream two ways:
 //
@@ -81,15 +81,15 @@ func main() {
 		}
 	}()
 
-	log.Printf("screenrelay listening on %s (client dir: %s)", cfg.Addr, cfg.ClientDir)
+	log.Printf("coaxial listening on %s (client dir: %s)", cfg.Addr, cfg.ClientDir)
 	if cfg.Bearer == "" {
-		log.Printf("WARNING: no SCREENRELAY_BEARER set; relay auth is DISABLED")
+		log.Printf("WARNING: no COAXIAL_BEARER set; relay auth is DISABLED")
 	}
 	if cfg.DisableCapture {
-		log.Printf("WARNING: SCREENRELAY_DISABLE_CAPTURE set; serving control channel only (no capture)")
+		log.Printf("WARNING: COAXIAL_DISABLE_CAPTURE set; serving control channel only (no capture)")
 	}
 	if cfg.DisableAudio {
-		log.Printf("WARNING: SCREENRELAY_DISABLE_AUDIO set; /audio WS connects but no audio pipeline starts")
+		log.Printf("WARNING: COAXIAL_DISABLE_AUDIO set; /audio WS connects but no audio pipeline starts")
 	}
 	log.Printf("video: browser connects to /raw (raw H.264 via WebCodecs, primary) or /stream (progressive fMP4 via MediaSource, fallback) and /relay (WS control channel)")
 
@@ -115,17 +115,17 @@ type config struct {
 }
 
 func loadConfig() config {
-	addr := os.Getenv("SCREENRELAY_ADDR")
+	addr := os.Getenv("COAXIAL_ADDR")
 	if addr == "" {
 		addr = ":8080"
 	}
-	clientDir := os.Getenv("SCREENRELAY_CLIENT_DIR")
+	clientDir := os.Getenv("COAXIAL_CLIENT_DIR")
 	if clientDir == "" {
 		clientDir = "client"
 	}
-	bearer := os.Getenv("SCREENRELAY_BEARER")
-	disableCapture := os.Getenv("SCREENRELAY_DISABLE_CAPTURE") != ""
-	disableAudio := os.Getenv("SCREENRELAY_DISABLE_AUDIO") != ""
+	bearer := os.Getenv("COAXIAL_BEARER")
+	disableCapture := os.Getenv("COAXIAL_DISABLE_CAPTURE") != ""
+	disableAudio := os.Getenv("COAXIAL_DISABLE_AUDIO") != ""
 
 	return config{
 		Addr:           addr,

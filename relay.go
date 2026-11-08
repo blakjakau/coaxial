@@ -738,7 +738,7 @@ func (rs *RelayServer) streamClientCount() int64 {
 // torn down) the goroutine clears the draining flag and, on failure, drops
 // the capture ref so a later connect can retry.
 func (rs *RelayServer) ensureCapture() {
-	// SCREENRELAY_DISABLE_CAPTURE: serve the control channel only; never start
+	// COAXIAL_DISABLE_CAPTURE: serve the control channel only; never start
 	// the (heavy) Mutter/PipeWire/GStreamer pipeline. The video stream stays
 	// empty, which is expected in this mode.
 	if rs.cfg.DisableCapture {
@@ -798,7 +798,7 @@ func (rs *RelayServer) audioClientCount() int64 {
 // (pulsesrc monitor -> opusenc -> oggmux -> fdsink) that fans its ogg-demuxed
 // opus packets out to rs.audio.
 func (rs *RelayServer) ensureAudio() {
-	// SCREENRELAY_DISABLE_AUDIO: never start the audio pipeline.
+	// COAXIAL_DISABLE_AUDIO: never start the audio pipeline.
 	if rs.cfg.DisableAudio {
 		return
 	}
