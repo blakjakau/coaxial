@@ -5,6 +5,23 @@ serves the live stream to a browser client. It also relays the browser's
 key/mouse input back to the remote machine via a Linux **uinput** virtual
 device.
 
+## Why
+
+Remote desktop on Linux is a mess. Chrome Remote Desktop doesn't really work
+on Linux at all; VNC is slow and painful; Remmina is often broken on Wayland.
+Multi-GPU systems struggle with all of them, and 4K streaming in particular is
+very poor with the existing tools. And every one of them demands a dedicated
+client app on the machine you're sitting at.
+
+What if the server could just host a web app directly? That's Coaxial: a
+single binary, wirtten in Go that captures the screen, encodes it with NVENC (where available), 
+and serves the stream to a plain browser tab — no client install, no dedicated app, just
+a URL. Steams video capture, audio and input over websockets.
+
+It's basic right now, early days. WOMM is the current milestone (achieved). 
+
+There's a lot more to do, to make it useful for anyone else other than me.
+
 ## Video paths
 
 - `/raw` (PRIMARY): raw H.264 (Annex-B) access units over a WebSocket, one
